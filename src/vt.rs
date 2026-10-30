@@ -484,6 +484,186 @@ pub struct Vt {
     regex: Option<RegexFind>,
     /// Counts writes and resizes: what the screen's text was read at.
     written: u64,
+    /// Copy mode's cursor and visual selection, while it's on.
+    copy: Option<CopyState>,
+}
+
+/// A visual selection in copy mode: characters (v), whole lines (V) or a block (Ctrl+V).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Visual {
+    Char,
+    Line,
+    Block,
+}
+
+/// A copy mode cursor move.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Motion {
+    Left,
+    Right,
+    Up(u32),
+    Down(u32),
+    /// 0
+    LineStart,
+    /// ^
+    FirstNonBlank,
+    /// $
+    LineEnd,
+    /// g, G: the first and last line.
+    Top,
+    Bottom,
+    /// 20G: a line of the history, from 0 at the top.
+    Row(u32),
+    /// H, M, L: the top, middle and bottom of the view; 3H, 3L: that many
+    /// lines in from the top or bottom (2 here).
+    ViewTop(u32),
+    ViewMiddle,
+    ViewBottom(u32),
+    /// {, }: the blank line before or after this paragraph.
+    ParagraphUp,
+    ParagraphDown,
+    /// w, b, e (W, B, E with `big`: words are anything between blanks).
+    WordNext { big: bool },
+    WordPrev { big: bool },
+    WordEnd { big: bool },
+    /// f, F, t, T: to (or `till` just before) a character on this line, forward
+    /// or back. `again`: a repeat (; ,), where t and T go past the character beside them.
+    Char { c: char, forward: bool, till: bool, again: bool },
+}
+
+/// A place in the text for word moves: a cell, or the end of a line that
+/// doesn't wrap (a break between words).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Spot {
+    Cell(u32, usize),
+    Break(u32),
+}
+
+/// Rows read for one word move, by screen row: each cell's (x, character)
+/// (wide characters once), and whether the row wraps onto the next.
+struct Rows<'a> {
+    vt: &'a Vt,
+    read: HashMap<u32, (Vec<(u16, char)>, bool)>,
+    last: u32,
+}
+
+impl Rows<'_> {
+    fn row(&mut self, y: u32) -> &(Vec<(u16, char)>, bool) {
+        let vt = self.vt;
+        self.read.entry(y).or_insert_with(|| vt.row_chars(y))
+    }
+
+    /// 0: blank, 1: a word character, 2: other (punctuation); `big`: 1 for anything not blank.
+    fn class(&mut self, at: Spot, big: bool) -> u8 {
+        let Spot::Cell(y, i) = at else { return 0 };
+        let c = self.row(y).0.get(i).map_or(' ', |c| c.1);
+        if c.is_whitespace() {
+            0
+        } else if big || c.is_alphanumeric() || c == '_' {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn next(&mut self, at: Spot) -> Option<Spot> {
+        match at {
+            Spot::Cell(y, i) => {
+                let (len, wraps) = { let r = self.row(y); (r.0.len(), r.1) };
+                if i + 1 < len {
+                    Some(Spot::Cell(y, i + 1))
+                } else if y >= self.last {
+                    None
+                } else if wraps {
+                    Some(Spot::Cell(y + 1, 0))
+                } else {
+                    Some(Spot::Break(y))
+                }
+            }
+            Spot::Break(y) => (y < self.last).then_some(Spot::Cell(y + 1, 0)),
+        }
+    }
+
+    fn prev(&mut self, at: Spot) -> Option<Spot> {
+        match at {
+            Spot::Cell(y, 0) => {
+                let y = y.checked_sub(1)?;
+                let (len, wraps) = { let r = self.row(y); (r.0.len(), r.1) };
+                Some(if wraps { Spot::Cell(y, len.saturating_sub(1)) } else { Spot::Break(y) })
+            }
+            Spot::Cell(y, i) => Some(Spot::Cell(y, i - 1)),
+            Spot::Break(y) => {
+                let len = self.row(y).0.len();
+                Some(Spot::Cell(y, len.saturating_sub(1)))
+            }
+        }
+    }
+
+    fn xy(&mut self, at: Spot) -> (u16, u32) {
+        match at {
+            Spot::Cell(y, i) => (self.row(y).0.get(i).map_or(0, |c| c.0), y),
+            Spot::Break(y) => (self.row(y).0.last().map_or(0, |c| c.0), y),
+        }
+    }
+
+    /// w: past this word and the blanks after it.
+    fn word_next(&mut self, mut at: Spot, big: bool) -> Spot {
+        let c = self.class(at, big);
+        while c != 0 && self.class(at, big) == c {
+            match self.next(at) { Some(n) => at = n, None => return at }
+        }
+        while self.class(at, big) == 0 {
+            match self.next(at) { Some(n) => at = n, None => return at }
+        }
+        at
+    }
+
+    /// e: to the end of this word, or the next one when already there.
+    fn word_end(&mut self, mut at: Spot, big: bool) -> Spot {
+        let Some(n) = self.next(at) else { return at };
+        at = n;
+        while self.class(at, big) == 0 {
+            match self.next(at) { Some(n) => at = n, None => return at }
+        }
+        let c = self.class(at, big);
+        while let Some(n) = self.next(at) {
+            if self.class(n, big) != c {
+                break;
+            }
+            at = n;
+        }
+        at
+    }
+
+    /// b: to the start of this word, or the one before when already there.
+    fn word_prev(&mut self, mut at: Spot, big: bool) -> Spot {
+        let Some(p) = self.prev(at) else { return at };
+        at = p;
+        while self.class(at, big) == 0 {
+            match self.prev(at) { Some(p) => at = p, None => return at }
+        }
+        let c = self.class(at, big);
+        while let Some(p) = self.prev(at) {
+            if self.class(p, big) != c {
+                break;
+            }
+            at = p;
+        }
+        at
+    }
+}
+
+/// Cells tracked by libghostty, so they stay on their text as output comes in
+/// and old history is dropped.
+struct CopyState {
+    cursor: GhosttyTrackedGridRef,
+    /// Where the visual selection started (null: no selection).
+    anchor: GhosttyTrackedGridRef,
+    visual: Option<Visual>,
+    /// The column j/k aim for (u16::MAX: the end of each line, after $).
+    column: u16,
+    /// The match a / or ? search points at (highlighted as the current one).
+    found: Option<Hit>,
 }
 
 /// A match's first and last cell, (x, y) in screen rows (0: the top of the scrollback).
@@ -647,6 +827,7 @@ impl Vt {
                 search: std::ptr::null_mut(),
                 regex: None,
                 written: 0,
+                copy: None,
             };
             vt.apply_theme();
             vt
@@ -1131,6 +1312,14 @@ impl Vt {
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
     }
 
+    /// How far up the view is: (lines above the bottom, lines of history).
+    pub fn scrolled_up(&self) -> (u64, u64) {
+        let mut sb = GhosttyTerminalScrollbar::default();
+        unsafe { ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &mut sb as *mut _ as *mut c_void) };
+        let history = sb.total.saturating_sub(sb.len);
+        (history.saturating_sub(sb.offset), history)
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         self.placements_cache.get_mut().take();
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
@@ -1202,6 +1391,10 @@ impl Vt {
     /// The selected match becomes the terminal's selection, so it's drawn highlighted.
     fn select_found(&mut self) -> Found {
         let found = self.read_found();
+        // In copy mode the selection is the visual one; matches only highlight.
+        if self.copy.is_some() {
+            return found;
+        }
         unsafe {
             let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
             if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut sel as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
@@ -1215,14 +1408,16 @@ impl Vt {
 
     /// Ends the find: no needle, no highlighted match. The view stays where it is.
     pub fn find_end(&mut self) {
-        if self.regex.take().is_some() {
+        if let Some(c) = self.copy.as_mut() {
+            c.found = None;
+        }
+        let had_regex = self.regex.take().is_some();
+        if !self.search.is_null() {
+            unsafe { ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null()) };
+        }
+        if (had_regex || !self.search.is_null()) && self.copy.is_none() {
             self.clear_selection();
         }
-        if self.search.is_null() {
-            return;
-        }
-        unsafe { ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null()) };
-        self.clear_selection();
     }
 
     /// Where the find's matches show in the viewport, as (row, first column,
@@ -1231,22 +1426,26 @@ impl Vt {
         let (mut current, mut others) = (Spans::new(), Spans::new());
         let rows = self.rows as u32;
         let last = self.cols.saturating_sub(1);
-        let mut add = |spans: &mut Spans, (x0, y0): (u16, i64), (x1, y1): (u16, i64)| {
+        let add = |spans: &mut Spans, (x0, y0): (u16, i64), (x1, y1): (u16, i64)| {
             for y in y0.max(0)..=y1.min(rows as i64 - 1) {
                 let from = if y == y0 { x0 } else { 0 };
                 let to = if y == y1 { x1 } else { last };
                 spans.push((y as u16, from, to));
             }
         };
+        // In copy mode, the current match is the one / or ? went to.
+        let copy_found = self.copy.as_ref().map(|c| c.found);
         if let Some(rf) = &self.regex {
             let Some(top) = self.viewport_top() else { return (current, others) };
             let (top, bottom) = (top as i64, top as i64 + rows as i64);
-            for (i, &((x0, y0), (x1, y1))) in rf.hits.iter().enumerate() {
+            for (i, &hit) in rf.hits.iter().enumerate() {
+                let ((x0, y0), (x1, y1)) = hit;
                 let (y0, y1) = (y0 as i64 - top, y1 as i64 - top);
                 if y1 < 0 || y0 >= bottom - top {
                     continue;
                 }
-                add(if rf.selected == Some(i) { &mut current } else { &mut others }, (x0, y0), (x1, y1));
+                let is_current = copy_found.map_or(rf.selected == Some(i), |f| f == Some(hit));
+                add(if is_current { &mut current } else { &mut others }, (x0, y0), (x1, y1));
             }
             return (current, others);
         }
@@ -1266,7 +1465,10 @@ impl Vt {
         let mut selected = None;
         unsafe {
             let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
-            if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut sel as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+            if let Some(found) = copy_found {
+                let top = self.viewport_top().unwrap_or(0) as i64;
+                selected = found.map(|((x0, y0), (x1, y1))| ((x0, y0 as i64 - top), (x1, y1 as i64 - top)));
+            } else if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut sel as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
                 selected = ends(&sel);
             }
             let mut buf = GhosttySelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
@@ -1287,6 +1489,408 @@ impl Vt {
             add(&mut current, a, b);
         }
         (current, others)
+    }
+
+    /// Enters copy mode: a cursor where the terminal's is, or at the bottom
+    /// left of the view when it's scrolled up.
+    pub fn copy_start(&mut self) {
+        self.copy_end();
+        let last = self.last_row();
+        let (x, y) = if self.scrolled_up().0 == 0 {
+            let (mut cx, mut cy) = (0u16, 0u16);
+            unsafe {
+                ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_CURSOR_X, &mut cx as *mut _ as *mut c_void);
+                ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &mut cy as *mut _ as *mut c_void);
+            }
+            (cx, (last + 1).saturating_sub(self.rows as u32) + cy as u32)
+        } else {
+            (0, self.viewport_top().unwrap_or(0) + self.rows as u32 - 1)
+        };
+        let Some(cursor) = self.track(x, y.min(last)) else { return };
+        self.copy = Some(CopyState { cursor, anchor: std::ptr::null_mut(), visual: None, column: x, found: None });
+    }
+
+    /// Leaves copy mode, dropping a visual selection.
+    pub fn copy_end(&mut self) {
+        let Some(c) = self.copy.take() else { return };
+        unsafe {
+            ghostty_tracked_grid_ref_free(c.cursor);
+            if !c.anchor.is_null() {
+                ghostty_tracked_grid_ref_free(c.anchor);
+                ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null());
+            }
+        }
+    }
+
+    /// The copy cursor, (x, y) in screen rows.
+    pub fn copy_cursor(&self) -> Option<(u16, u32)> {
+        self.tracked_at(self.copy.as_ref()?.cursor)
+    }
+
+    /// The copy cursor's cell in the view, if it's in view.
+    pub fn copy_cursor_view(&self) -> Option<(u16, u16)> {
+        let (x, y) = self.copy_cursor()?;
+        let row = y.checked_sub(self.viewport_top()?)?;
+        (row < self.rows as u32).then_some((x, row as u16))
+    }
+
+    pub fn copy_visual(&self) -> Option<Visual> {
+        self.copy.as_ref()?.visual
+    }
+
+    pub fn copy_move(&mut self, m: Motion) {
+        let Some((x, y)) = self.copy_cursor() else { return };
+        let column = self.copy.as_ref().map_or(x, |c| c.column);
+        let last = self.last_row();
+        let top = self.viewport_top().unwrap_or(0);
+        let rows = self.rows as u32;
+        // Vertical moves keep aiming for the column, short lines stop at their end.
+        let aim = |vt: &Vt, y: u32| column.min(vt.line_end(y));
+        let (x, y, column) = match m {
+            Motion::Left => {
+                let mut nx = x.saturating_sub(1);
+                if nx > 0 && self.spacer(nx, y) {
+                    nx -= 1;
+                }
+                (nx, y, nx)
+            }
+            Motion::Right => {
+                let end = self.line_end(y).max(x);
+                let mut nx = (x + 1).min(end);
+                if nx < end && self.spacer(nx, y) {
+                    nx += 1;
+                }
+                (nx, y, nx)
+            }
+            Motion::Up(n) => {
+                let ny = y.saturating_sub(n);
+                (aim(self, ny), ny, column)
+            }
+            Motion::Down(n) => {
+                let ny = (y + n).min(last);
+                (aim(self, ny), ny, column)
+            }
+            Motion::LineStart => (0, y, 0),
+            Motion::FirstNonBlank => {
+                let nx = self.blanks(y).iter().position(|b| !b).unwrap_or(0) as u16;
+                (nx, y, nx)
+            }
+            Motion::LineEnd => (self.line_end(y), y, u16::MAX),
+            Motion::Top => (0, 0, 0),
+            Motion::Bottom => (aim(self, last), last, column),
+            Motion::Row(n) => {
+                let ny = n.min(last);
+                (aim(self, ny), ny, column)
+            }
+            Motion::ViewTop(n) => {
+                let ny = (top + n.min(rows - 1)).min(last);
+                (aim(self, ny), ny, column)
+            }
+            Motion::ViewMiddle => {
+                let ny = (top + rows / 2).min(last);
+                (aim(self, ny), ny, column)
+            }
+            Motion::ViewBottom(n) => {
+                let ny = (top + rows - 1 - n.min(rows - 1)).min(last);
+                (aim(self, ny), ny, column)
+            }
+            // Past any blank lines here, then the paragraph, as tmux and vi do.
+            Motion::ParagraphUp => {
+                let mut ny = y.saturating_sub(1);
+                while ny > 0 && self.blank(ny) {
+                    ny -= 1;
+                }
+                while ny > 0 && !self.blank(ny) {
+                    ny -= 1;
+                }
+                (0, ny, 0)
+            }
+            Motion::WordNext { big } | Motion::WordPrev { big } | Motion::WordEnd { big } => {
+                let mut r = Rows { vt: self, read: HashMap::new(), last };
+                let i = r.row(y).0.iter().rposition(|c| c.0 <= x).unwrap_or(0);
+                let at = Spot::Cell(y, i);
+                let to = match m {
+                    Motion::WordNext { .. } => r.word_next(at, big),
+                    Motion::WordPrev { .. } => r.word_prev(at, big),
+                    _ => r.word_end(at, big),
+                };
+                let (nx, ny) = r.xy(to);
+                (nx, ny, nx)
+            }
+            Motion::Char { c, forward, till, again } => {
+                let (cells, _) = self.row_chars(y);
+                let here = cells.iter().rposition(|cell| cell.0 <= x).unwrap_or(0);
+                // A t/T repeated from just before its character goes on to the next one.
+                let skip = if till && again { 2 } else { 1 };
+                let found = if forward {
+                    cells.iter().enumerate().skip(here + skip).find(|(_, cell)| cell.1 == c).map(|(i, _)| if till { i - 1 } else { i })
+                } else {
+                    cells[..here.saturating_sub(skip - 1)].iter().rposition(|cell| cell.1 == c).map(|i| if till { i + 1 } else { i })
+                };
+                match found {
+                    Some(i) => (cells[i].0, y, cells[i].0),
+                    None => (x, y, column),
+                }
+            }
+            Motion::ParagraphDown => {
+                let mut ny = (y + 1).min(last);
+                while ny < last && self.blank(ny) {
+                    ny += 1;
+                }
+                while ny < last && !self.blank(ny) {
+                    ny += 1;
+                }
+                (0, ny, 0)
+            }
+        };
+        self.copy_set(x, y, column);
+    }
+
+    /// Scrolls the view by `lines` (down is positive). `carry`: the cursor moves
+    /// as far (Ctrl+D/U/F/B); otherwise it stays, kept in view (Ctrl+E/Y).
+    pub fn copy_scroll(&mut self, lines: isize, carry: bool) {
+        let Some((x, y)) = self.copy_cursor() else { return };
+        let column = self.copy.as_ref().map_or(x, |c| c.column);
+        self.scroll_viewport(lines);
+        let ny = if carry {
+            (y as i64 + lines as i64).clamp(0, self.last_row() as i64) as u32
+        } else {
+            let top = self.viewport_top().unwrap_or(0);
+            y.clamp(top, top + self.rows as u32 - 1)
+        };
+        self.copy_set(column.min(self.line_end(ny)), ny, column);
+    }
+
+    /// Starts a visual selection at the cursor, switches its kind, or (the same
+    /// kind again) drops it.
+    pub fn copy_select(&mut self, v: Visual) {
+        let Some((x, y)) = self.copy_cursor() else { return };
+        let Some(c) = self.copy.as_ref() else { return };
+        match c.visual {
+            Some(now) if now == v => return self.copy_unselect(),
+            Some(_) => {}
+            None => {
+                let Some(anchor) = self.track(x, y) else { return };
+                if let Some(c) = self.copy.as_mut() {
+                    c.anchor = anchor;
+                }
+            }
+        }
+        if let Some(c) = self.copy.as_mut() {
+            c.visual = Some(v);
+        }
+        self.copy_selection();
+    }
+
+    pub fn copy_unselect(&mut self) {
+        let Some(c) = self.copy.as_mut() else { return };
+        c.visual = None;
+        let anchor = std::mem::replace(&mut c.anchor, std::ptr::null_mut());
+        if !anchor.is_null() {
+            unsafe { ghostty_tracked_grid_ref_free(anchor) };
+        }
+        self.clear_selection();
+    }
+
+    /// Moves the cursor (clamped to the screen), scrolls to keep it in view and
+    /// stretches the visual selection to it.
+    fn copy_set(&mut self, x: u16, y: u32, column: u16) {
+        let Some(c) = self.copy.as_mut() else { return };
+        c.column = column;
+        let cursor = c.cursor;
+        let (x, y) = (x.min(self.cols.saturating_sub(1)), y.min(self.last_row()));
+        let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_SCREEN, ..Default::default() };
+        p.value.coordinate = GhosttyPointCoordinate { x, y };
+        unsafe { ghostty_tracked_grid_ref_set(cursor, self.term, p) };
+        self.scroll_into_view(y, y);
+        self.copy_selection();
+    }
+
+    /// Scrolls as little as shows rows y0..=y1 (from y0, if they don't fit).
+    fn scroll_into_view(&mut self, y0: u32, y1: u32) {
+        let top = self.viewport_top().unwrap_or(0);
+        let rows = self.rows as u32;
+        if y0 >= top && y1 < top + rows {
+            return;
+        }
+        self.placements_cache.get_mut().take();
+        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
+        s.value.row = if y0 < top || y1 + 1 - y0 > rows { y0 } else { y1 + 1 - rows } as usize;
+        unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+    }
+
+    /// Goes to the find's next match from the copy cursor, toward older output
+    /// (up, `?`) or newer (down, `/`), wrapping. `move_cursor`: the cursor goes
+    /// to it (Enter, n, N); else the view only shows it (while typing). False
+    /// when nothing matches.
+    pub fn copy_jump(&mut self, older: bool, move_cursor: bool) -> bool {
+        let Some((x, y)) = self.copy_cursor() else { return false };
+        let mut hits = self.find_hits();
+        // Reading order, newest (furthest down) first.
+        let key = |h: &Hit| (h.0 .1, h.0 .0);
+        hits.sort_by_key(|h| std::cmp::Reverse(key(h)));
+        let at = (y, x);
+        let pick = if older {
+            hits.iter().find(|h| key(h) < at).or(hits.first())
+        } else {
+            hits.iter().rev().find(|h| key(h) > at).or(hits.last())
+        };
+        let hit = pick.copied();
+        if let Some(c) = self.copy.as_mut() {
+            c.found = hit;
+        }
+        let Some(((x0, y0), (_, y1))) = hit else { return false };
+        if move_cursor {
+            self.copy_set(x0, y0, x0);
+        } else {
+            self.scroll_into_view(y0, y1);
+        }
+        if self.copy_visual().is_none() {
+            self.clear_selection();
+        }
+        true
+    }
+
+    /// Every match of the find (plain or regex), in screen rows.
+    fn find_hits(&mut self) -> Vec<Hit> {
+        if self.regex.is_some() {
+            let written = self.written;
+            let mut rf = self.regex.take().unwrap();
+            if rf.at != written {
+                rf.hits = self.regex_hits(&rf.re);
+                rf.at = written;
+                rf.selected = rf.selected.filter(|&i| i < rf.hits.len());
+            }
+            let hits = rf.hits.clone();
+            self.regex = Some(rf);
+            return hits;
+        }
+        if self.search.is_null() {
+            return Vec::new();
+        }
+        let point = |r: &GhosttyGridRef| unsafe {
+            let mut p = GhosttyPointCoordinate::default();
+            (ghostty_terminal_point_from_grid_ref(self.term, r, GHOSTTY_POINT_TAG_SCREEN, &mut p) == GHOSTTY_SUCCESS).then_some((p.x, p.y))
+        };
+        unsafe {
+            ghostty_search_run(self.search);
+            let mut buf = GhosttySelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
+            ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_MATCHES, &mut buf as *mut _ as *mut c_void);
+            if buf.len == 0 {
+                return Vec::new();
+            }
+            let mut matches = vec![GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() }; buf.len];
+            buf = GhosttySelectionBuffer { ptr: matches.as_mut_ptr(), cap: matches.len(), len: 0 };
+            if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_MATCHES, &mut buf as *mut _ as *mut c_void) != GHOSTTY_SUCCESS {
+                return Vec::new();
+            }
+            matches[..buf.len.min(matches.len())].iter().filter_map(|m| Some((point(&m.start)?, point(&m.end)?))).collect()
+        }
+    }
+
+    /// The visual selection from its start to the cursor, as the terminal's selection.
+    fn copy_selection(&mut self) {
+        let Some(c) = self.copy.as_ref() else { return };
+        let (Some(v), Some(a), Some(b)) = (c.visual, self.tracked_at(c.anchor), self.tracked_at(c.cursor)) else { return };
+        let ((x0, y0), (x1, y1)) = match v {
+            // Reading order: by row, then column.
+            Visual::Char if (a.1, a.0) <= (b.1, b.0) => (a, b),
+            Visual::Char => (b, a),
+            Visual::Line => ((0, a.1.min(b.1)), (self.cols.saturating_sub(1), a.1.max(b.1))),
+            Visual::Block => ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1))),
+        };
+        let (Some(start), Some(end)) = (self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x0, y0), self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x1, y1)) else { return };
+        let sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle: v == Visual::Block };
+        unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void) };
+    }
+
+    fn track(&self, x: u16, y: u32) -> Option<GhosttyTrackedGridRef> {
+        let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_SCREEN, ..Default::default() };
+        p.value.coordinate = GhosttyPointCoordinate { x, y };
+        let mut r = std::ptr::null_mut();
+        (unsafe { ghostty_terminal_grid_ref_track(self.term, p, &mut r) } == GHOSTTY_SUCCESS).then_some(r)
+    }
+
+    fn tracked_at(&self, r: GhosttyTrackedGridRef) -> Option<(u16, u32)> {
+        if r.is_null() {
+            return None;
+        }
+        let mut p = GhosttyPointCoordinate::default();
+        (unsafe { ghostty_tracked_grid_ref_point(r, GHOSTTY_POINT_TAG_SCREEN, &mut p) } == GHOSTTY_SUCCESS).then_some((p.x, p.y))
+    }
+
+    /// The last screen row (history and the screen together, from 0).
+    fn last_row(&self) -> u32 {
+        let mut sb = GhosttyTerminalScrollbar::default();
+        unsafe { ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &mut sb as *mut _ as *mut c_void) };
+        (sb.total.max(self.rows as u64) - 1) as u32
+    }
+
+    /// Which cells of a row show nothing (blank, or the right half of a wide character).
+    fn blanks(&self, y: u32) -> Vec<bool> {
+        let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) else { return Vec::new() };
+        (0..self.cols)
+            .map(|x| {
+                r.x = x;
+                let mut cps = [0u32; 4];
+                let mut len = 0usize;
+                unsafe { ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len) };
+                len == 0 || cps[..len.min(4)].iter().all(|&c| c == ' ' as u32)
+            })
+            .collect()
+    }
+
+    /// A row's characters by cell (x, character; blank cells ' ', wide ones
+    /// once), and whether it wraps onto the next row.
+    fn row_chars(&self, y: u32) -> (Vec<(u16, char)>, bool) {
+        let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) else { return (Vec::new(), false) };
+        let wraps = unsafe {
+            let mut line: GhosttyRow = Default::default();
+            let mut wrap = false;
+            ghostty_grid_ref_row(&r, &mut line) == GHOSTTY_SUCCESS
+                && ghostty_row_get(line, GHOSTTY_ROW_DATA_WRAP, &mut wrap as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+                && wrap
+        };
+        let mut cells = Vec::with_capacity(self.cols as usize);
+        for x in 0..self.cols {
+            r.x = x;
+            unsafe {
+                let mut cell: GhosttyCell = Default::default();
+                ghostty_grid_ref_cell(&r, &mut cell);
+                let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+                if wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD {
+                    continue;
+                }
+                let mut cps = [0u32; 4];
+                let mut len = 0usize;
+                ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len);
+                let c = if len == 0 { ' ' } else { char::from_u32(cps[0]).unwrap_or(' ') };
+                cells.push((x, c));
+            }
+        }
+        (cells, wraps)
+    }
+
+    fn blank(&self, y: u32) -> bool {
+        self.blanks(y).iter().all(|b| *b)
+    }
+
+    /// The last cell with text on a row (0 when it's empty).
+    fn line_end(&self, y: u32) -> u16 {
+        self.blanks(y).iter().rposition(|b| !b).unwrap_or(0) as u16
+    }
+
+    /// The right half of a wide character.
+    fn spacer(&self, x: u16, y: u32) -> bool {
+        let Some(r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x, y) else { return false };
+        unsafe {
+            let mut cell: GhosttyCell = Default::default();
+            ghostty_grid_ref_cell(&r, &mut cell);
+            let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+            wide == GHOSTTY_CELL_WIDE_SPACER_TAIL
+        }
     }
 
     /// Searches the screen and scrollback for a regex (case-insensitive unless
@@ -1329,16 +1933,23 @@ impl Vt {
     fn show_regex(&mut self) -> Found {
         let Some(rf) = &self.regex else { return Found::default() };
         let found = Found { selected: rf.selected, total: rf.hits.len() };
+        let selects = self.copy.is_none();
         let Some(((x0, y0), (x1, y1))) = rf.selected.map(|i| rf.hits[i]) else {
-            self.clear_selection();
+            if selects {
+                self.clear_selection();
+            }
             return found;
         };
         let (Some(start), Some(end)) = (self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x0, y0), self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x1, y1)) else {
-            self.clear_selection();
+            if selects {
+                self.clear_selection();
+            }
             return found;
         };
-        let sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle: false };
-        unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void) };
+        if selects {
+            let sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle: false };
+            unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void) };
+        }
         let top = self.viewport_top().unwrap_or(0);
         if y0 < top || y1 >= top + self.rows as u32 {
             // A third down, so what led up to it shows too.
@@ -1722,6 +2333,7 @@ impl Vt {
 
 impl Drop for Vt {
     fn drop(&mut self) {
+        self.copy_end();
         unsafe {
             if !self.search.is_null() {
                 ghostty_search_free(self.search);
@@ -1836,6 +2448,228 @@ mod tests {
         vt.find_end();
         assert_eq!(vt.found(), Found::default());
         assert_eq!(vt.find_spans(), (Spans::new(), Spans::new()));
+    }
+
+    #[test]
+    fn scrolled_up_counts_lines_above_the_bottom() {
+        let mut vt = Vt::new(20, 5);
+        for line in 1..=100 {
+            vt.write(format!("{line:03}\r\n").as_bytes());
+        }
+        // 101 lines (the last empty) on a 5-row screen: 96 of history.
+        assert_eq!(vt.scrolled_up(), (0, 96));
+        vt.scroll_viewport(-10);
+        assert_eq!(vt.scrolled_up(), (10, 96));
+        vt.scroll_viewport(-10_000);
+        assert_eq!(vt.scrolled_up(), (96, 96));
+        let top: String = vt.frame().rows[0].iter().map(|c| c.text.as_str()).collect();
+        assert!(top.starts_with("001"), "{top:?}");
+        vt.scroll_to_bottom();
+        assert_eq!(vt.scrolled_up(), (0, 96));
+    }
+
+    #[test]
+    fn copy_cursor_moves_scrolls_and_selects() {
+        let mut vt = Vt::new(20, 5);
+        for line in 1..=50 {
+            vt.write(format!("{line:03} line\r\n").as_bytes());
+        }
+        vt.write(b"$ ");
+        vt.copy_start();
+        // Starts on the terminal's cursor: the prompt, at the bottom (row 50 of 0..=50).
+        assert_eq!(vt.copy_cursor(), Some((2, 50)));
+        vt.copy_move(Motion::LineStart);
+        vt.copy_move(Motion::Up(3));
+        assert_eq!(vt.copy_cursor(), Some((0, 47)));
+        // $ goes to the last character, and j/k keep to line ends after it.
+        vt.copy_move(Motion::LineEnd);
+        assert_eq!(vt.copy_cursor(), Some((7, 47)));
+        vt.copy_move(Motion::Down(3));
+        assert_eq!(vt.copy_cursor(), Some((0, 50)), "the prompt line ends at its $");
+        vt.copy_move(Motion::Up(1));
+        assert_eq!(vt.copy_cursor(), Some((7, 49)));
+        // l stops at the line's end; h at the start.
+        vt.copy_move(Motion::Right);
+        assert_eq!(vt.copy_cursor(), Some((7, 49)));
+        for _ in 0..10 {
+            vt.copy_move(Motion::Left);
+        }
+        assert_eq!(vt.copy_cursor(), Some((0, 49)));
+        vt.copy_move(Motion::FirstNonBlank);
+        assert_eq!(vt.copy_cursor(), Some((0, 49)));
+        // Moving above the view scrolls it.
+        vt.copy_move(Motion::Top);
+        assert_eq!(vt.copy_cursor(), Some((0, 0)));
+        assert_eq!(vt.copy_cursor_view(), Some((0, 0)));
+        assert!(vt.frame().rows[0].iter().map(|c| c.text.as_str()).collect::<String>().starts_with("001"));
+        vt.copy_move(Motion::ViewBottom(0));
+        assert_eq!(vt.copy_cursor(), Some((0, 4)));
+        // 20G: line 20, counted from 1 at the top (row 19); past the end, the last line.
+        vt.copy_move(Motion::Row(19));
+        assert_eq!(vt.copy_cursor(), Some((0, 19)));
+        vt.copy_move(Motion::Row(9_999));
+        assert_eq!(vt.copy_cursor(), Some((0, 50)));
+        vt.copy_move(Motion::Top);
+        vt.copy_move(Motion::ViewBottom(0));
+        // 2H, 2L: the second line from the top or the bottom of the view.
+        vt.copy_move(Motion::ViewTop(1));
+        assert_eq!(vt.copy_cursor(), Some((0, 1)));
+        vt.copy_move(Motion::ViewBottom(1));
+        assert_eq!(vt.copy_cursor(), Some((0, 3)));
+        vt.copy_move(Motion::ViewTop(99));
+        assert_eq!(vt.copy_cursor(), Some((0, 4)), "no further than the view");
+        vt.copy_move(Motion::Bottom);
+        assert_eq!(vt.copy_cursor_view(), Some((0, 4)));
+        // Ctrl+U carries the cursor; Ctrl+Y keeps it, in view.
+        vt.copy_scroll(-2, true);
+        assert_eq!(vt.copy_cursor(), Some((0, 48)));
+        vt.copy_scroll(-10, false);
+        assert_eq!(vt.copy_cursor_view().map(|c| c.1), Some(4));
+
+        // v: characters in reading order, backwards too.
+        vt.copy_move(Motion::Top);
+        vt.copy_move(Motion::Down(1));
+        vt.copy_move(Motion::Right);
+        vt.copy_select(Visual::Char);
+        vt.copy_move(Motion::Up(1));
+        assert_eq!(vt.selection_text().as_deref(), Some("01 line\n00"));
+        // V: whole lines; Ctrl+V: a block.
+        vt.copy_select(Visual::Line);
+        vt.copy_move(Motion::Down(2));
+        assert_eq!(vt.copy_visual(), Some(Visual::Line));
+        assert_eq!(vt.selection_text().as_deref(), Some("002 line\n003 line"));
+        vt.copy_select(Visual::Block);
+        vt.copy_move(Motion::Right);
+        assert_eq!(vt.selection_text().as_deref(), Some("02\n03"));
+        // The same kind again drops it.
+        vt.copy_select(Visual::Block);
+        assert_eq!((vt.copy_visual(), vt.selection_text()), (None, None));
+
+        // The cursor and the selection stay on their text as output comes in.
+        vt.copy_move(Motion::Top);
+        vt.copy_select(Visual::Line);
+        for line in 51..=60 {
+            vt.write(format!("{line:03} line\r\n").as_bytes());
+        }
+        assert_eq!(vt.copy_cursor(), Some((0, 0)));
+        assert_eq!(vt.selection_text().as_deref(), Some("001 line"));
+        vt.copy_end();
+        assert_eq!((vt.copy_cursor(), vt.selection_text()), (None, None));
+    }
+
+    #[test]
+    fn copy_mode_searches_and_paragraphs() {
+        let mut vt = Vt::new(20, 5);
+        // Paragraphs of three lines with a blank line after each; "mark" on 1, 5, 9 ...
+        for p in 0..10 {
+            for l in 0..3 {
+                let word = if l == 1 { "mark" } else { "text" };
+                vt.write(format!("{p}{l} {word}\r\n").as_bytes());
+            }
+            vt.write(b"\r\n");
+        }
+        // Rows: paragraph p is rows 4p..4p+2, its blank line 4p+3; the prompt row 40.
+        vt.copy_start();
+        assert_eq!(vt.copy_cursor(), Some((0, 40)));
+        vt.copy_move(Motion::ParagraphUp);
+        assert_eq!(vt.copy_cursor(), Some((0, 35)), "the blank line above the last paragraph");
+        vt.copy_move(Motion::ParagraphUp);
+        assert_eq!(vt.copy_cursor(), Some((0, 31)));
+        vt.copy_move(Motion::ParagraphDown);
+        assert_eq!(vt.copy_cursor(), Some((0, 35)));
+        vt.copy_move(Motion::Top);
+        vt.copy_move(Motion::ParagraphUp);
+        assert_eq!(vt.copy_cursor(), Some((0, 0)), "stops at the top");
+
+        // / from the top: the next match down; n keeps going, N goes back.
+        vt.find("mark");
+        assert!(vt.copy_jump(false, true));
+        assert_eq!(vt.copy_cursor(), Some((3, 1)));
+        assert!(vt.copy_jump(false, true));
+        assert_eq!(vt.copy_cursor(), Some((3, 5)));
+        assert!(vt.copy_jump(true, true));
+        assert_eq!(vt.copy_cursor(), Some((3, 1)));
+        // ? from the first one wraps to the last.
+        assert!(vt.copy_jump(true, true));
+        assert_eq!(vt.copy_cursor(), Some((3, 37)));
+        assert_eq!(vt.copy_cursor_view(), Some((3, 4)), "scrolled to it");
+        // The match it went to is the current highlight.
+        let (current, _) = vt.find_spans();
+        assert_eq!(current, vec![(4, 3, 6)]);
+        // Typing only shows the match: the cursor stays.
+        vt.copy_move(Motion::Top);
+        assert!(vt.copy_jump(false, false));
+        assert_eq!(vt.copy_cursor(), Some((0, 0)));
+
+        // Regex too, and a visual selection survives searching.
+        vt.copy_select(Visual::Line);
+        vt.find_regex(r"^5\d").unwrap();
+        assert_eq!(vt.selection_text().as_deref(), Some("00 text"), "find doesn't take the selection");
+        assert!(vt.copy_jump(false, true));
+        assert_eq!(vt.copy_cursor(), Some((0, 20)));
+        assert!(vt.selection_text().unwrap().starts_with("00 text\n01 mark"));
+        assert!(vt.selection_text().unwrap().ends_with("50 text"));
+        vt.find_regex("nothing").unwrap();
+        assert!(!vt.copy_jump(false, true));
+        assert_eq!(vt.copy_cursor(), Some((0, 20)));
+        vt.copy_end();
+    }
+
+    #[test]
+    fn copy_mode_word_and_character_moves() {
+        let mut vt = Vt::new(30, 5);
+        vt.write(b"foo.bar(baz) qux\r\n");
+        vt.write(b"\r\n");
+        vt.write(b"  next-line end\r\n");
+        // 34 columns on 30: wraps; "wrapped" straddles the rows.
+        vt.write(b"aaaaaaaaaaaaaaaaaaaaaaaaa wrapped tail\r\n");
+        vt.copy_start();
+        vt.copy_move(Motion::Top);
+        let at = |vt: &Vt| vt.copy_cursor().unwrap();
+        let w = |vt: &mut Vt, m: Motion, n: usize| {
+            for _ in 0..n {
+                vt.copy_move(m);
+            }
+            vt.copy_cursor().unwrap()
+        };
+        // w: words and punctuation apart; W: blanks only. Past the blank line.
+        assert_eq!(w(&mut vt, Motion::WordNext { big: false }, 1), (3, 0), "the .");
+        assert_eq!(w(&mut vt, Motion::WordNext { big: false }, 1), (4, 0), "bar");
+        assert_eq!(w(&mut vt, Motion::WordNext { big: false }, 4), (13, 0), "qux, past ( baz )");
+        assert_eq!(w(&mut vt, Motion::WordNext { big: false }, 1), (2, 2), "next, past the blank line and indent");
+        vt.copy_move(Motion::Top);
+        assert_eq!(w(&mut vt, Motion::WordNext { big: true }, 1), (13, 0));
+        assert_eq!(w(&mut vt, Motion::WordNext { big: true }, 2), (12, 2), "end");
+        // e and E: word ends; b and B back.
+        assert_eq!(w(&mut vt, Motion::WordEnd { big: false }, 1), (14, 2));
+        vt.copy_move(Motion::Top);
+        assert_eq!(w(&mut vt, Motion::WordEnd { big: false }, 1), (2, 0), "foo");
+        assert_eq!(w(&mut vt, Motion::WordEnd { big: false }, 1), (3, 0), "the .");
+        assert_eq!(w(&mut vt, Motion::WordEnd { big: true }, 1), (11, 0), "foo.bar(baz)");
+        assert_eq!(w(&mut vt, Motion::WordPrev { big: false }, 1), (8, 0), "baz");
+        assert_eq!(w(&mut vt, Motion::WordPrev { big: true }, 1), (0, 0));
+        // A word the terminal wrapped is one word.
+        vt.copy_move(Motion::Down(3));
+        assert_eq!(at(&vt), (0, 3));
+        assert_eq!(w(&mut vt, Motion::WordNext { big: false }, 1), (26, 3), "wrapped");
+        assert_eq!(w(&mut vt, Motion::WordEnd { big: false }, 1), (2, 4), "its end on the next row");
+        assert_eq!(w(&mut vt, Motion::WordPrev { big: false }, 1), (26, 3));
+
+        // f/F/t/T on the line; t again (;) goes past the character beside it.
+        vt.copy_move(Motion::Top);
+        let ch = |c, forward, till, again| Motion::Char { c, forward, till, again };
+        assert_eq!(w(&mut vt, ch('b', true, false, false), 1), (4, 0));
+        assert_eq!(w(&mut vt, ch('b', true, false, true), 1), (8, 0));
+        assert_eq!(w(&mut vt, ch('o', false, false, false), 1), (2, 0));
+        vt.copy_move(Motion::LineStart);
+        assert_eq!(w(&mut vt, ch('(', true, true, false), 1), (6, 0), "just before (");
+        assert_eq!(w(&mut vt, ch('(', true, true, false), 1), (6, 0), "t stays when it's beside it");
+        assert_eq!(w(&mut vt, ch('a', true, true, false), 1), (8, 0), "before baz's a");
+        assert_eq!(w(&mut vt, ch('a', true, true, true), 1), (8, 0), "no a after it: stays");
+        assert_eq!(w(&mut vt, ch('.', false, true, false), 1), (4, 0), "just after .");
+        assert_eq!(w(&mut vt, ch('z', true, false, false), 1), (10, 0));
+        assert_eq!(w(&mut vt, ch('#', true, false, false), 1), (10, 0), "not on the line: stays");
+        vt.copy_end();
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod hc;
 mod keys;
 mod layout;
 mod layout_sync;
+mod line_edit;
 mod links;
 mod model;
 mod mirror;

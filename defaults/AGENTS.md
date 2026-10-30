@@ -549,7 +549,10 @@ The main ones:
   right-click targeting follow keyboard focus, including peek and floating terminals;
   with no terminal holding keyboard focus, they use the focused pane or block.
   `terminal.find {text?}` opens the focused terminal's find bar (Cmd+F on macOS,
-  Ctrl+Shift+F elsewhere): it searches the screen and history as you type (ASCII
+  Ctrl+Shift+F elsewhere): it opens with the last search (in any terminal) selected,
+  so typing replaces it; readline keys edit the query (Ctrl+A/E/B/F/H/D/W/U/K,
+  Alt+B/F/D/Backspace, arrows, Home/End; paste goes into it). It searches the
+  screen and history as you type (ASCII
   letters in any case), scrolls to the newest match and selects it; Enter or
   `terminal.find_next` goes to older matches, Shift+Enter or `terminal.find_prev`
   to newer, Esc closes it and leaves the view where it is. Alt+R or the bar's `.*`
@@ -558,6 +561,25 @@ The main ones:
   highlighted behind the text: the selected one in theme color `find_current`,
   the rest in `find_match` (`#rrggbbaa` keeps the text readable), e.g.
   settings.json `"colors": { "find_current": "#ff8c00aa", "find_match": "#ffd70066" }`.
+  `terminal.copy_mode {on?}` (Cmd+Shift+C on macOS, Ctrl+Shift+Space elsewhere)
+  is tmux's copy mode with vi keys: a cursor in the focused terminal's history,
+  moved by h/j/k/l (Ctrl+N/P, arrows), w/b/e and W/B/E (words; a word the
+  terminal wrapped is one), f/F/t/T and a character (on the line; ; and , repeat
+  it), 0 ^ $, g/G (top, bottom), H/M/L (in view) and { } (the blank line before
+  or after a paragraph); Ctrl+D/U and
+  Ctrl+F/B scroll half or a whole screen with it, Ctrl+E/Y a line without it.
+  / and ? open the find bar searching down or up from the cursor (the view
+  follows while typing, plain or regex); Enter moves the cursor to the match, then
+  n repeats the search and N goes the other way; matches stay highlighted until
+  copy mode ends. v, V and Ctrl+V (or space) select characters, whole lines or a
+  block; y or Enter copies the selection and leaves. Esc drops the selection, then
+  leaves; q leaves; leaving goes back to the bottom. The screen holds still in
+  copy mode: the program keeps running, and its output (the badge's ⏸ size) is
+  shown when copy mode ends (past 16 MB it catches up and holds again). A count typed first repeats
+  a move, scroll or n/N (3w, 5j, 2fx, 2 Ctrl+D), and before g or G goes to that
+  line (20G), before H or L that many lines in from the top or bottom of the view;
+  the badge shows it while typed. Keys don't reach the program
+  meanwhile; pasting leaves first. Cmd shortcuts and the find bar still work.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. Programs that track the mouse still get their mouse events
   (hold Shift to select text instead).

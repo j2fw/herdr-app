@@ -61,6 +61,7 @@
   "terminal": {
     "cmd-c": "terminal.copy",
     "cmd-f": "terminal.find",
+    "cmd-shift-c": "terminal.copy_mode",
     "cmd-g": "terminal.find_next",
     "cmd-shift-g": "terminal.find_prev",
     "cmd-v": "terminal.paste",

@@ -65,6 +65,7 @@
     "ctrl-right": "send:\u001bf",
     "ctrl-shift-c": "terminal.copy",
     "ctrl-shift-f": "terminal.find",
+    "ctrl-shift-space": "terminal.copy_mode",
     "ctrl-shift-v": "terminal.paste",
     "ctrl-v": "terminal.paste_image"
   }

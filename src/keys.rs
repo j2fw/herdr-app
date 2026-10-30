@@ -191,6 +191,8 @@ pub fn install(bindings: Vec<KeyBinding>, cx: &mut App) {
         KeyBinding::new(ESCAPE_HATCH, ShellAction::new("app.reset"), None),
         KeyBinding::new("escape", ShellAction::new("overlay.close"), Some("Overlay")),
     ]);
+    // The terminal find bar's keys, after the kit's so they win in its input.
+    cx.bind_keys(crate::terminal::find_bar_keys());
 }
 
 #[cfg(test)]

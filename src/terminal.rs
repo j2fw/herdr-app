@@ -11,6 +11,8 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use crate::line_edit::LineEdit;
+use gpui_base::input::{InputEvent, InputState};
 use crate::links;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,14 +34,47 @@ enum LinkTarget {
     Terminal(String),
 }
 
-/// The find bar: what's typed, whether it's a regex, and where it stands.
-#[derive(Clone, Default)]
+/// The find bar: its text input (the palette's), whether it's a regex, and
+/// where it stands.
+#[derive(Clone)]
 struct FindBar {
-    query: String,
+    input: Entity<InputState>,
     regex: bool,
     found: vt::Found,
     /// The regex doesn't parse.
     error: Option<String>,
+}
+
+// The find bar's keys, bound in keys.rs over the text input's own (readline's
+// where they differ: Ctrl+A/E/B/F/H/D/W/U/K, Alt+B/F/D).
+actions!(
+    find_bar,
+    [Close, Older, Newer, ToggleRegex, Home, End, Left, Right, Backspace, Delete, Rubout, KillToStart, KillToEnd, WordLeft, WordRight, KillWord]
+);
+
+/// The keys for those, in the find bar's input only.
+pub fn find_bar_keys() -> Vec<KeyBinding> {
+    let ctx = Some("FindBar > Input");
+    vec![
+        KeyBinding::new("escape", Close, ctx),
+        KeyBinding::new("enter", Older, ctx),
+        KeyBinding::new("down", Older, ctx),
+        KeyBinding::new("shift-enter", Newer, ctx),
+        KeyBinding::new("up", Newer, ctx),
+        KeyBinding::new("alt-r", ToggleRegex, ctx),
+        KeyBinding::new("ctrl-a", Home, ctx),
+        KeyBinding::new("ctrl-e", End, ctx),
+        KeyBinding::new("ctrl-b", Left, ctx),
+        KeyBinding::new("ctrl-f", Right, ctx),
+        KeyBinding::new("ctrl-h", Backspace, ctx),
+        KeyBinding::new("ctrl-d", Delete, ctx),
+        KeyBinding::new("ctrl-w", Rubout, ctx),
+        KeyBinding::new("ctrl-u", KillToStart, ctx),
+        KeyBinding::new("ctrl-k", KillToEnd, ctx),
+        KeyBinding::new("alt-b", WordLeft, ctx),
+        KeyBinding::new("alt-f", WordRight, ctx),
+        KeyBinding::new("alt-d", KillWord, ctx),
+    ]
 }
 
 pub enum TerminalEvent {
@@ -83,7 +118,12 @@ struct Grid {
     painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>)>,
     /// The font size, cell size, font and fonts loaded the drawings were built with.
     painted_with: (u32, Size<Pixels>, String, u64),
+    /// Output held back while copy mode keeps the screen still (None: live).
+    held: Option<Vec<u8>>,
 }
+
+/// Held output past this is let through: the screen catches up and holds again.
+const HOLD_MAX: usize = 16 << 20;
 
 pub struct TerminalView {
     pub address: String,
@@ -116,10 +156,26 @@ pub struct TerminalView {
     scrolled: f32,
     /// The find bar, while open.
     find: Option<FindBar>,
+    /// Its input's changes and Enter.
+    _find_input: Option<Subscription>,
+    /// Copy mode, as in tmux: keys scroll the history instead of reaching the program.
+    copy_mode: bool,
+    /// Which way copy mode's last search went: `?` older (up), `/` newer (down).
+    search_older: bool,
+    /// The last find bar was a regex: the next one starts as one too.
+    find_regex: bool,
+    /// f, F, t or T waiting for its character: (forward, till, count).
+    char_pending: Option<(bool, bool, u32)>,
+    /// A count being typed (3 in 3w).
+    count: Option<u32>,
+    /// The last f/F/t/T, for ; and ,: (character, forward, till).
+    char_last: Option<(char, bool, bool)>,
     _reader: Option<Task<()>>,
 }
 
 thread_local! {
+    /// The last thing searched for in any terminal: a new find bar starts with it.
+    static LAST_FIND: RefCell<String> = const { RefCell::new(String::new()) };
     /// Terminals with output waiting for the next tick of the output clock.
     static OUTPUT_CLOCK: RefCell<Vec<WeakEntity<TerminalView>>> = const { RefCell::new(Vec::new()) };
 }
@@ -180,6 +236,7 @@ impl TerminalView {
                 cursor_at: None,
                 painted: Vec::new(),
                 painted_with: (0, Size::default(), String::new(), 0),
+                held: None,
             })),
             focus: cx.focus_handle(),
             was_focused: false,
@@ -187,6 +244,13 @@ impl TerminalView {
             typed_at: Cell::new(None),
             scrolled: 0.0,
             find: None,
+            _find_input: None,
+            copy_mode: false,
+            search_older: true,
+            find_regex: false,
+            char_pending: None,
+            count: None,
+            char_last: None,
             _reader: None,
         };
         view.connect(core, false, cx);
@@ -320,6 +384,21 @@ impl TerminalView {
             for item in batch {
                 match item {
                     Stream::Data(bytes) => {
+                        // Copy mode holds output back (the core is still told it arrived,
+                        // so the program never waits); it's written when copy mode ends.
+                        if let Some(held) = g.held.as_mut()
+                            && held.len() + bytes.len() <= HOLD_MAX
+                        {
+                            held.extend_from_slice(&bytes);
+                            if let Some(ch) = g.channel {
+                                g.core.credit(ch, bytes.len());
+                            }
+                            continue;
+                        }
+                        if let Some(held) = g.held.as_mut().filter(|h| !h.is_empty()) {
+                            let held = std::mem::take(held);
+                            g.vt.write(&held);
+                        }
                         g.vt.allow_clipboard_write(crate::settings::get().clipboard_write);
                         g.vt.write(&bytes);
                         let [clipboard, primary] = g.vt.take_clipboard();
@@ -459,6 +538,8 @@ impl TerminalView {
     /// Text as a paste; copied files (Finder, a clipboard manager's image) as
     /// if dropped; an image alone (a screenshot) as Ctrl+V pastes it.
     pub fn paste(&mut self, cx: &mut Context<Self>) {
+        // Pasting is typing: it leaves copy mode first.
+        self.copy_mode(Some(false), cx);
         let Some(item) = cx.read_from_clipboard() else { return };
         if let Some(paths) = copied_files(&item) {
             self.dropped(paths, cx);
@@ -472,6 +553,11 @@ impl TerminalView {
 
     /// Ctrl+V: a remote image, clipboard text on Windows, or the key itself.
     pub fn paste_image(&mut self, cx: &mut Context<Self>) {
+        // Ctrl+V is bound to this, and in copy mode it selects a block, as in tmux.
+        if self.copy_mode {
+            self.grid.borrow_mut().vt.copy_select(vt::Visual::Block);
+            return cx.notify();
+        }
         if self.send_image(cx) {
             return;
         }
@@ -503,19 +589,82 @@ impl TerminalView {
         }
     }
 
-    /// Opens the find bar (or types `text` into it, as a regex or not); an
-    /// open bar searches again.
-    pub fn find(&mut self, text: Option<&str>, regex: Option<bool>, cx: &mut Context<Self>) {
-        let mut bar = self.find.take().unwrap_or_default();
-        if let Some(text) = text {
-            bar.query = text.to_owned();
-        }
+    /// Opens the find bar and puts the keyboard in it (with `text`, searches for
+    /// it; as a regex or not). A new bar starts with the last search, all
+    /// selected, so typing replaces it.
+    pub fn find(&mut self, text: Option<&str>, regex: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
+        let opened = self.find.is_none();
+        let bar = match self.find.take() {
+            Some(bar) => bar,
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find…"));
+                self._find_input = Some(cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _w, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.find_run(cx);
+                    }
+                }));
+                FindBar { input, regex: self.find_regex, found: vt::Found::default(), error: None }
+            }
+        };
+        let mut bar = bar;
         if let Some(regex) = regex {
             bar.regex = regex;
         }
+        let value = text.map(str::to_owned).or_else(|| opened.then(|| LAST_FIND.with_borrow(Clone::clone)));
+        bar.input.update(cx, |input, cx| {
+            if let Some(value) = &value {
+                input.set_value(value.clone(), window, cx);
+            }
+            // The text all selected (typing replaces it), or the cursor after `text`.
+            if text.is_some() {
+                let end = input.value().len();
+                input.set_selected_range(end..end, cx);
+            } else {
+                input.select_all(window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.find = Some(bar);
+        self.find_run(cx);
+    }
+
+    fn find_query(&self, cx: &App) -> String {
+        self.find.as_ref().map_or(String::new(), |b| b.input.read(cx).value().to_string())
+    }
+
+    /// A readline edit of the query (the input does the rest itself).
+    fn find_edit(&mut self, edit: impl FnOnce(&mut LineEdit), window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bar) = self.find.as_ref() else { return };
+        let input = bar.input.clone();
+        let changed = input.update(cx, |input, cx| {
+            let text = input.value().to_string();
+            let sel = input.selected_range();
+            let mut line = LineEdit { all: !text.is_empty() && sel == (0..text.len()), cursor: input.cursor(), text: text.clone() };
+            edit(&mut line);
+            if line.text != text {
+                input.set_value(line.text.clone(), window, cx);
+            }
+            input.set_selected_range(line.cursor..line.cursor, cx);
+            line.text != text
+        });
+        // set_value doesn't report a change: search here.
+        if changed {
+            self.find_run(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Searches for the bar's query.
+    fn find_run(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_query(cx);
+        let Some(mut bar) = self.find.take() else { return };
+        if !query.is_empty() {
+            LAST_FIND.with_borrow_mut(|last| last.clone_from(&query));
+        }
         let mut g = self.grid.borrow_mut();
         (bar.found, bar.error) = if bar.regex {
-            match g.vt.find_regex(&bar.query) {
+            match g.vt.find_regex(&query) {
                 Ok(found) => (found, None),
                 Err(e) => {
                     g.vt.find_end();
@@ -523,10 +672,32 @@ impl TerminalView {
                 }
             }
         } else {
-            (g.vt.find(&bar.query), None)
+            (g.vt.find(&query), None)
         };
+        // In copy mode the view follows the match nearest the cursor, the way it's going.
+        if self.copy_mode && bar.error.is_none() && !query.is_empty() {
+            g.vt.copy_jump(self.search_older, false);
+        }
         drop(g);
+        self.find_regex = bar.regex;
         self.find = Some(bar);
+        cx.notify();
+    }
+
+    /// Opens the find bar for copy mode's / (newer) or ? (older), with the last search.
+    fn copy_search(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_older = older;
+        self.find_hide(window, cx);
+        self.find(None, None, window, cx);
+    }
+
+    /// Copy mode's Enter in the find bar (n, N after): the cursor goes to the
+    /// next match its way (`reverse`: the other way). The bar closes; the
+    /// matches stay highlighted until copy mode ends.
+    fn copy_search_next(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let older = self.search_older != reverse;
+        self.grid.borrow_mut().vt.copy_jump(older, true);
+        self.find_hide(window, cx);
         cx.notify();
     }
 
@@ -537,53 +708,272 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn find_toggle_regex(&mut self, cx: &mut Context<Self>) {
-        let regex = !self.find.as_ref().is_some_and(|b| b.regex);
-        self.find(None, Some(regex), cx);
+    /// Enter, Shift+Enter and the arrows in the bar: the next match, or in
+    /// copy mode the cursor to it.
+    fn find_go(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.copy_mode {
+            self.copy_search_next(!older, window, cx);
+        } else {
+            self.find_step(older, cx);
+        }
     }
 
-    pub fn find_close(&mut self, cx: &mut Context<Self>) {
-        if self.find.take().is_some() {
+    fn find_toggle_regex(&mut self, cx: &mut Context<Self>) {
+        let Some(bar) = self.find.as_mut() else { return };
+        bar.regex = !bar.regex;
+        self.find_run(cx);
+    }
+
+    /// Closes the bar and ends the find; the keyboard goes back to the terminal.
+    pub fn find_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_some() {
+            self.find_hide(window, cx);
             self.grid.borrow_mut().vt.find_end();
             cx.notify();
         }
     }
 
-    /// Keys while the find bar is open: typing edits the query, Enter goes to
-    /// older matches (Shift+Enter newer), Alt+R toggles regex, Esc closes.
-    /// Shortcuts pass through.
-    fn find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let Some(bar) = self.find.as_ref() else { return false };
-        let k = &ev.keystroke;
-        let m = k.modifiers;
-        if m.alt && !m.platform && !m.control && k.key == "r" {
-            self.find_toggle_regex(cx);
-            return true;
+    /// Closes the bar, keeping the find (copy mode's n and N go on with it).
+    fn find_hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self._find_input = None;
+        self.focus.focus(window, cx);
+    }
+
+    /// keys.json's `send:` bindings that edit a shell line (Cmd+Left sends
+    /// Ctrl+A, Alt+Left Esc-b, ...) edit the find bar's query the same way.
+    fn find_send(&mut self, bytes: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let edit: fn(&mut LineEdit) = match bytes {
+            "\u{1}" => LineEdit::home,
+            "\u{5}" => LineEdit::end,
+            "\u{2}" => LineEdit::left,
+            "\u{6}" => LineEdit::right,
+            "\u{15}" => LineEdit::kill_to_start,
+            "\u{b}" => LineEdit::kill_to_end,
+            "\u{17}" => LineEdit::rubout,
+            "\u{1b}b" => LineEdit::word_left,
+            "\u{1b}f" => LineEdit::word_right,
+            "\u{1b}d" => LineEdit::kill_word,
+            "\u{1b}\u{7f}" | "\u{1b}\u{8}" => LineEdit::kill_word_back,
+            _ => return,
+        };
+        self.find_edit(edit, window, cx);
+    }
+
+    /// Enters or leaves copy mode (no `on`: toggles). Leaving goes back to the bottom.
+    pub fn copy_mode(&mut self, on: Option<bool>, cx: &mut Context<Self>) {
+        let on = on.unwrap_or(!self.copy_mode);
+        if on == self.copy_mode {
+            return;
         }
-        if m.platform || m.control {
+        self.copy_mode = on;
+        self.char_pending = None;
+        self.count = None;
+        let mut g = self.grid.borrow_mut();
+        if on {
+            g.vt.copy_start();
+            g.held = Some(Vec::new());
+        } else {
+            g.vt.copy_end();
+            // What came meanwhile, as if it had just arrived.
+            if let Some(held) = g.held.take().filter(|h| !h.is_empty()) {
+                g.vt.allow_clipboard_write(crate::settings::get().clipboard_write);
+                g.vt.write(&held);
+                let [clipboard, primary] = g.vt.take_clipboard();
+                if let Some(text) = clipboard {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(text) = primary {
+                    cx.write_to_primary(ClipboardItem::new_string(text));
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = primary;
+                if let Some(ch) = g.channel {
+                    let replies = g.vt.take_replies();
+                    g.core.input(ch, &replies);
+                }
+                if let Some(title) = g.vt.take_title() {
+                    drop(g);
+                    let title = if title.is_empty() { self.address.clone() } else { title };
+                    self.set_title(&title, cx);
+                    g = self.grid.borrow_mut();
+                }
+            }
+            // Highlights left by / and ? go with it (an open find bar keeps its own).
+            if self.find.is_none() {
+                g.vt.find_end();
+            }
+            g.vt.scroll_to_bottom();
+        }
+        drop(g);
+        cx.notify();
+    }
+
+    /// Keys in copy mode, as tmux's vi keys: h/j/k/l (and Ctrl+N/P, the arrows)
+    /// move the cursor, 0 ^ $ along the line, g/G to the top or bottom, H/M/L
+    /// in the view; Ctrl+D/U half a screen and Ctrl+F/B a screen (the cursor
+    /// along), Ctrl+E/Y a line (the cursor stays); v, V, Ctrl+V select
+    /// characters, lines or a block, y or Enter copies and leaves. Esc drops a
+    /// selection, then leaves; q leaves. Other keys do nothing; Cmd shortcuts pass.
+    fn copy_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.copy_mode {
             return false;
         }
-        let mut query = bar.query.clone();
-        match k.key.as_str() {
-            "escape" => self.find_close(cx),
-            "enter" | "down" | "up" => self.find_step(k.key == "down" || (k.key == "enter" && !m.shift), cx),
-            "backspace" => {
-                query.pop();
-                self.find(Some(&query), None, cx);
-            }
-            _ => match k.key_char.as_deref().or((k.key == "space").then_some(" ")) {
-                Some(text) if !text.chars().any(char::is_control) => {
-                    query.push_str(text);
-                    self.find(Some(&query), None, cx);
-                }
-                _ => {}
-            },
+        let k = &ev.keystroke;
+        let m = k.modifiers;
+        if m.platform || m.alt {
+            return false;
         }
+        use vt::{Motion::*, Visual};
+        let rows = self.grid.borrow().vt.rows as isize;
+        let half = (rows / 2).max(1);
+        enum Do {
+            Move(vt::Motion),
+            Scroll(isize, bool),
+            Select(Visual),
+            Search(bool),
+            Next(bool),
+            Await(bool, bool),
+            Yank,
+            Escape,
+            Leave,
+            Nothing,
+        }
+        // Typed characters by what they type (Shift+4 is "$" on a US keyboard,
+        // other keys elsewhere); Ctrl keys and named keys by key.
+        let typed = if m.control { None } else { k.key_char.as_deref() };
+        // The character f/F/t/T were waiting for (Esc or a Ctrl key cancels them).
+        if let Some((forward, till, n)) = self.char_pending.take() {
+            if let Some(c) = typed.and_then(|t| t.chars().next()).filter(|c| !c.is_control()) {
+                self.char_last = Some((c, forward, till));
+                let mut g = self.grid.borrow_mut();
+                // 3fx: the third x; the first t stays beside its character, repeats go past.
+                for i in 0..n {
+                    g.vt.copy_move(Char { c, forward, till, again: i > 0 });
+                }
+            }
+            cx.notify();
+            return true;
+        }
+        // A count: digits before a key (0 starts the line unless a count is under way).
+        if let Some(d) = typed.filter(|t| t.len() == 1).and_then(|t| t.parse::<u32>().ok())
+            && (d > 0 || self.count.is_some())
+        {
+            self.count = Some((self.count.unwrap_or(0) * 10 + d).min(99_999));
+            cx.notify();
+            return true;
+        }
+        let count = self.count.take();
+        let n = count.unwrap_or(1);
+        if count.is_some() && k.key == "escape" {
+            cx.notify();
+            return true;
+        }
+        let repeat = |reverse: bool| self.char_last.map(|(c, forward, till)| Char { c, forward: forward != reverse, till, again: true });
+        let action = match (m.control, typed, k.key.as_str()) {
+            (true, _, "n") | (false, Some("j"), _) | (false, _, "down") => Do::Move(Down(n)),
+            (true, _, "p") | (false, Some("k"), _) | (false, _, "up") => Do::Move(Up(n)),
+            (false, Some("h"), _) | (false, _, "left") => Do::Move(Left),
+            (false, Some("l"), _) | (false, _, "right") => Do::Move(Right),
+            (false, Some("0"), _) | (false, _, "home") => Do::Move(LineStart),
+            (false, Some("^"), _) => Do::Move(FirstNonBlank),
+            (false, Some("$"), _) | (false, _, "end") => Do::Move(LineEnd),
+            (false, Some("g" | "G"), _) if count.is_some() => Do::Move(Row(n - 1)),
+            (false, Some("g"), _) => Do::Move(Top),
+            (false, Some("G"), _) => Do::Move(Bottom),
+            (false, Some("H"), _) => Do::Move(ViewTop(n - 1)),
+            (false, Some("M"), _) => Do::Move(ViewMiddle),
+            (false, Some("L"), _) => Do::Move(ViewBottom(n - 1)),
+            (false, Some("w"), _) => Do::Move(WordNext { big: false }),
+            (false, Some("W"), _) => Do::Move(WordNext { big: true }),
+            (false, Some("b"), _) => Do::Move(WordPrev { big: false }),
+            (false, Some("B"), _) => Do::Move(WordPrev { big: true }),
+            (false, Some("e"), _) => Do::Move(WordEnd { big: false }),
+            (false, Some("E"), _) => Do::Move(WordEnd { big: true }),
+            (false, Some("f"), _) => Do::Await(true, false),
+            (false, Some("F"), _) => Do::Await(false, false),
+            (false, Some("t"), _) => Do::Await(true, true),
+            (false, Some("T"), _) => Do::Await(false, true),
+            (false, Some(";"), _) => repeat(false).map_or(Do::Nothing, Do::Move),
+            (false, Some(","), _) => repeat(true).map_or(Do::Nothing, Do::Move),
+            (false, Some("{"), _) => Do::Move(ParagraphUp),
+            (false, Some("}"), _) => Do::Move(ParagraphDown),
+            (false, Some("/"), _) => Do::Search(false),
+            (false, Some("?"), _) => Do::Search(true),
+            (false, Some("n"), _) => Do::Next(false),
+            (false, Some("N"), _) => Do::Next(true),
+            (true, _, "d") => Do::Scroll(half, true),
+            (true, _, "u") => Do::Scroll(-half, true),
+            (true, _, "f") | (false, _, "pagedown") => Do::Scroll(rows, true),
+            (true, _, "b") | (false, _, "pageup") => Do::Scroll(-rows, true),
+            (true, _, "e") => Do::Scroll(1, false),
+            (true, _, "y") => Do::Scroll(-1, false),
+            (false, Some("v"), _) | (false, _, "space") => Do::Select(Visual::Char),
+            (false, Some("V"), _) => Do::Select(Visual::Line),
+            (true, _, "v") => Do::Select(Visual::Block),
+            (false, Some("y"), _) | (false, _, "enter") => Do::Yank,
+            (false, _, "escape") => Do::Escape,
+            (false, Some("q"), _) => Do::Leave,
+            _ => Do::Nothing,
+        };
+        // j/k and 20G carry their count; other moves repeat.
+        let reps = match &action {
+            Do::Move(Up(_) | Down(_) | Row(_) | ViewTop(_) | ViewBottom(_)) => 1,
+            _ => n.min(10_000),
+        };
+        let mut g = self.grid.borrow_mut();
+        match action {
+            Do::Move(motion) => {
+                for _ in 0..reps {
+                    g.vt.copy_move(motion);
+                }
+            }
+            Do::Scroll(lines, carry) => g.vt.copy_scroll(lines * reps as isize, carry),
+            Do::Select(v) => g.vt.copy_select(v),
+            Do::Await(forward, till) => {
+                self.char_pending = Some((forward, till, reps));
+                drop(g);
+                cx.notify();
+                return true;
+            }
+            Do::Search(older) => {
+                drop(g);
+                self.copy_search(older, window, cx);
+                return true;
+            }
+            Do::Next(reverse) => {
+                drop(g);
+                for _ in 0..reps.min(1000) {
+                    self.copy_search_next(reverse, window, cx);
+                }
+                return true;
+            }
+            Do::Yank => {
+                drop(g);
+                self.copy(cx);
+                self.copy_mode(Some(false), cx);
+                return true;
+            }
+            Do::Escape if g.vt.copy_visual().is_some() => g.vt.copy_unselect(),
+            Do::Escape | Do::Leave => {
+                drop(g);
+                self.copy_mode(Some(false), cx);
+                return true;
+            }
+            Do::Nothing => return true,
+        }
+        drop(g);
+        cx.notify();
         true
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.find_key(ev, cx) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed in the find bar's input are its own.
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        if self.copy_key(ev, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1163,7 +1553,14 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
     let origin = point(snap(origin.x), snap(origin.y));
     g.origin = origin;
-    let frame = g.vt.frame();
+    let mut frame = g.vt.frame();
+    // In copy mode its cursor is the one shown, a block in the accent color.
+    if let Some((x, y)) = g.vt.copy_cursor_view() {
+        let accent = crate::settings::theme().get("accent").map_or(vt::theme().cursor, |c| crate::settings::rgb(c));
+        frame.cursor = Some(vt::Cursor { x, y, shape: CursorShape::Block, color: accent });
+    } else if g.vt.copy_cursor().is_some() {
+        frame.cursor = None;
+    }
     let placements = g.vt.placements();
     let mut images: Vec<(bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
     let mut keep = std::collections::HashSet::new();
@@ -1363,9 +1760,8 @@ impl EntityInputHandler for TerminalView {
 
     fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
         self.grid.borrow_mut().marked = None;
-        if let Some(bar) = self.find.as_ref() {
-            let query = format!("{}{text}", bar.query);
-            return self.find(Some(&query), None, cx);
+        if self.copy_mode {
+            return;
         }
         self.send(text.as_bytes());
         cx.notify();
@@ -1421,6 +1817,33 @@ impl Render for TerminalView {
             bar.found = self.grid.borrow_mut().vt.found();
         }
         let find = self.find.clone();
+        let copy_mode = self.copy_mode.then(|| {
+            let g = self.grid.borrow();
+            let label = match g.vt.copy_visual() {
+                None => "COPY",
+                Some(vt::Visual::Char) => "VISUAL",
+                Some(vt::Visual::Line) => "V-LINE",
+                Some(vt::Visual::Block) => "V-BLOCK",
+            };
+            let mut typing = self.count.map_or(String::new(), |n| n.to_string());
+            if let Some((forward, till, _)) = self.char_pending {
+                typing.push(match (forward, till) {
+                    (true, false) => 'f',
+                    (false, false) => 'F',
+                    (true, true) => 't',
+                    (false, true) => 'T',
+                });
+            }
+            // The screen holds still; this much output is waiting.
+            let held = g.held.as_ref().map_or(0, Vec::len);
+            if held > 0 {
+                if !typing.is_empty() {
+                    typing.push(' ');
+                }
+                typing.push_str(&format!("⏸ {}", held_size(held)));
+            }
+            (label, typing, g.vt.scrolled_up())
+        });
 
         div()
             .id(SharedString::from(format!("term-{}", self.address)))
@@ -1430,9 +1853,12 @@ impl Render for TerminalView {
             .relative()
             // Below 1, the layout's background shows through (cells a program colors stay solid).
             .bg(hsla(vt::theme().bg).opacity(crate::settings::get().terminal_opacity))
-            .on_action(cx.listener(|this, a: &gpui_shell::action::ShellAction, _, cx| {
+            .on_action(cx.listener(|this, a: &gpui_shell::action::ShellAction, window, cx| {
                 // `send:<text>` bindings from keys.json type into this terminal.
+                // While finding, line-editing ones edit the query; copy mode keeps the rest from the program.
                 match a.id().strip_prefix("send:") {
+                    Some(text) if this.find.is_some() && !this.focus.is_focused(window) => this.find_send(text, window, cx),
+                    Some(_) if this.copy_mode => {}
                     Some(text) => this.send(text.as_bytes()),
                     None => cx.propagate(),
                 }
@@ -1520,6 +1946,11 @@ impl Render for TerminalView {
                         let cols = ((f32::from(bounds.size.width) - 2.0 * px_) / f32::from(cell.width)).floor().max(2.0) as u16;
                         let rows = ((f32::from(bounds.size.height) - 2.0 * py_) / f32::from(cell.height)).floor().max(1.0) as u16;
                         if (cols, rows) != (g.vt.cols, g.vt.rows) || dev != g.vt_cell {
+                            // Output held by copy mode was written for the old size.
+                            if let Some(held) = g.held.as_mut().filter(|h| !h.is_empty()) {
+                                let held = std::mem::take(held);
+                                g.vt.write(&held);
+                            }
                             g.vt.resize(cols, rows, dev.0, dev.1);
                             g.vt_cell = dev;
                             if let Some(chan) = g.channel {
@@ -1568,14 +1999,34 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
-            .when_some(find, |d, FindBar { query, regex, found, error }| {
+            .when_some(copy_mode, |d, (label, typing, (up, history))| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .left_3()
+                        .px_2()
+                        .py_0p5()
+                        .flex()
+                        .gap_2()
+                        .rounded_md()
+                        .bg(crate::settings::color("accent"))
+                        .text_color(crate::settings::color("accent_foreground"))
+                        .text_sm()
+                        .font_family(crate::settings::get().font_family.clone())
+                        .child(label)
+                        .when(!typing.is_empty(), |d| d.child(typing))
+                        .child(format!("[{up}/{history}]")),
+                )
+            })
+            .when_some(find, |d, FindBar { input, regex, found, error }| {
+                let query = input.read(cx).value().to_string();
                 let count = match (query.is_empty(), found.selected, &error) {
                     (true, _, _) => String::new(),
                     (false, _, Some(_)) => "invalid regex".to_owned(),
                     (false, Some(i), _) => format!("{}/{}", i + 1, found.total),
                     (false, None, _) => "no matches".to_owned(),
                 };
-                let placeholder = if regex { "Find regex…" } else { "Find…" };
                 d.child(
                     div()
                         .id("find-bar")
@@ -1600,7 +2051,30 @@ impl Render for TerminalView {
                         // Clicks on the bar stay on it (no selection under it).
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .when_some(error, |d, e| d.tooltip(move |_, cx| cx.new(|_| FindError(e.clone())).into()))
-                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(if query.is_empty() { placeholder.to_owned() } else { format!("{query}▏") }))
+                        // The palette's text input; readline keys and Enter/Esc/arrows are bound over its own.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .key_context("FindBar")
+                                .on_action(cx.listener(|this, _: &Close, window, cx| this.find_close(window, cx)))
+                                .on_action(cx.listener(|this, _: &Older, window, cx| this.find_go(true, window, cx)))
+                                .on_action(cx.listener(|this, _: &Newer, window, cx| this.find_go(false, window, cx)))
+                                .on_action(cx.listener(|this, _: &ToggleRegex, _, cx| this.find_toggle_regex(cx)))
+                                .on_action(cx.listener(|this, _: &Home, window, cx| this.find_edit(LineEdit::home, window, cx)))
+                                .on_action(cx.listener(|this, _: &End, window, cx| this.find_edit(LineEdit::end, window, cx)))
+                                .on_action(cx.listener(|this, _: &Left, window, cx| this.find_edit(LineEdit::left, window, cx)))
+                                .on_action(cx.listener(|this, _: &Right, window, cx| this.find_edit(LineEdit::right, window, cx)))
+                                .on_action(cx.listener(|this, _: &Backspace, window, cx| this.find_edit(LineEdit::backspace, window, cx)))
+                                .on_action(cx.listener(|this, _: &Delete, window, cx| this.find_edit(LineEdit::delete, window, cx)))
+                                .on_action(cx.listener(|this, _: &Rubout, window, cx| this.find_edit(LineEdit::rubout, window, cx)))
+                                .on_action(cx.listener(|this, _: &KillToStart, window, cx| this.find_edit(LineEdit::kill_to_start, window, cx)))
+                                .on_action(cx.listener(|this, _: &KillToEnd, window, cx| this.find_edit(LineEdit::kill_to_end, window, cx)))
+                                .on_action(cx.listener(|this, _: &WordLeft, window, cx| this.find_edit(LineEdit::word_left, window, cx)))
+                                .on_action(cx.listener(|this, _: &WordRight, window, cx| this.find_edit(LineEdit::word_right, window, cx)))
+                                .on_action(cx.listener(|this, _: &KillWord, window, cx| this.find_edit(LineEdit::kill_word, window, cx)))
+                                .child(gpui_base::input::Input::new(&input)),
+                        )
                         .child(div().flex_none().text_color(crate::settings::color(if count == "invalid regex" { "blocked" } else { "muted" })).child(count))
                         .child(
                             div()
@@ -1623,7 +2097,7 @@ impl Render for TerminalView {
                                 .cursor_pointer()
                                 .text_color(crate::settings::color("muted"))
                                 .hover(|s| s.text_color(crate::settings::color("foreground")))
-                                .on_click(cx.listener(|this, _, _, cx| this.find_close(cx)))
+                                .on_click(cx.listener(|this, _, window, cx| this.find_close(window, cx)))
                                 .child("✕"),
                         ),
                 )
@@ -1643,6 +2117,15 @@ impl Render for TerminalView {
                         .child(format!("[{why}]")),
                 )
             })
+    }
+}
+
+/// Output held by copy mode, for its badge: 812 B, 14 KB, 3.2 MB.
+fn held_size(n: usize) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{} KB", n / 1024),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
     }
 }
 
@@ -1674,6 +2157,14 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_output_sizes_read_short() {
+        use super::held_size;
+        assert_eq!(held_size(812), "812 B");
+        assert_eq!(held_size(14 * 1024 + 300), "14 KB");
+        assert_eq!(held_size(3 * 1_048_576 + 200_000), "3.2 MB");
+    }
+
     #[test]
     fn selection_autoscroll_only_runs_outside_the_grid_and_caps_speed() {
         use super::selection_scroll_lines as lines;

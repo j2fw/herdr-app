@@ -301,9 +301,17 @@ Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when 
 
 No arguments.
 
+## `terminal.copy_mode`
+
+Copy mode in the focused terminal, as tmux's vi keys (no on: toggle), the screen held still meanwhile (the program runs on; its output shows when copy mode ends): a cursor moved by h/j/k/l, w/b/e and W/B/E, f/F/t/T and ; , 0 ^ $, g/G, H/M/L, { } (paragraphs); / and ? search down or up (Enter goes there, n/N again); Ctrl+D/U/F/B and Ctrl+E/Y scroll; v, V and Ctrl+V select characters, lines or a block; y or Enter copies and leaves; Esc drops the selection, then leaves (back to the bottom); q leaves. A count before a key repeats it (3w, 5j, 2fx, 2n); before g or G it's a line number.
+
+| Argument | Required |
+|---|---|
+| `on` | no |
+
 ## `terminal.find`
 
-Find text in the focused terminal's screen and history: opens its find bar (with text, searches for it; regex: true for a regex, case-insensitive unless (?-i)). Enter: older match, Shift+Enter: newer, Alt+R: regex on/off, Esc: close.
+Find text in the focused terminal's screen and history: opens its find bar with the last search selected (with text, searches for it; regex: true for a regex, case-insensitive unless (?-i)). Enter: older match, Shift+Enter: newer, Alt+R: regex on/off, Esc: close.
 
 | Argument | Required |
 |---|---|

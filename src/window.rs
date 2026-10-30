@@ -2939,6 +2939,13 @@ impl AppWindow {
                 }
                 return;
             }
+            "terminal.copy_mode" => {
+                let on = a.get("on").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")));
+                if let Some(t) = self.focused_terminal(window) {
+                    t.view.update(cx, |v, cx| v.copy_mode(on, cx));
+                }
+                return;
+            }
             "terminal.find" | "terminal.find_next" | "terminal.find_prev" => {
                 let text = Self::arg(a, "text").map(str::to_owned);
                 let regex = a.get("regex").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")));
@@ -2946,7 +2953,7 @@ impl AppWindow {
                     t.view.update(cx, |v, cx| match name {
                         "terminal.find_next" => v.find_step(true, cx),
                         "terminal.find_prev" => v.find_step(false, cx),
-                        _ => v.find(text.as_deref(), regex, cx),
+                        _ => v.find(text.as_deref(), regex, window, cx),
                     });
                 }
                 return;
