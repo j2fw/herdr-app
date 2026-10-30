@@ -60,6 +60,9 @@
   },
   "terminal": {
     "cmd-c": "terminal.copy",
+    "cmd-f": "terminal.find",
+    "cmd-g": "terminal.find_next",
+    "cmd-shift-g": "terminal.find_prev",
     "cmd-v": "terminal.paste",
     "ctrl-v": "terminal.paste_image",
     "alt-left": "send:\u001bb",

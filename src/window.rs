@@ -2939,6 +2939,17 @@ impl AppWindow {
                 }
                 return;
             }
+            "terminal.find" | "terminal.find_next" | "terminal.find_prev" => {
+                let text = Self::arg(a, "text").map(str::to_owned);
+                if let Some(t) = self.focused_terminal(window) {
+                    t.view.update(cx, |v, cx| match name {
+                        "terminal.find_next" => v.find_step(true, cx),
+                        "terminal.find_prev" => v.find_step(false, cx),
+                        _ => v.find(text.as_deref(), cx),
+                    });
+                }
+                return;
+            }
             // ---- agents
             "agent.focus" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default().to_owned();

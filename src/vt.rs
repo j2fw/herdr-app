@@ -478,6 +478,15 @@ pub struct Vt {
     placements_cache: RefCell<Option<Vec<Placement>>>,
     /// Whether the program wants win32 key events (Ghostty doesn't track it).
     pub win32: crate::win32_keys::Win32Input,
+    /// The find bar's search, made the first time it's used (null until then).
+    search: GhosttySearch,
+}
+
+/// Where a find stands: which match is selected (0 is the newest) of how many.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Found {
+    pub selected: Option<usize>,
+    pub total: usize,
 }
 
 /// What of the cursor a frame shows: (on screen, x, y, visible, style).
@@ -620,6 +629,7 @@ impl Vt {
                 seen_with: (0, 0),
                 placements_cache: RefCell::new(None),
                 win32: Default::default(),
+                search: std::ptr::null_mut(),
             };
             vt.apply_theme();
             vt
@@ -1104,6 +1114,83 @@ impl Vt {
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
     }
 
+    /// Searches the screen and scrollback for `needle` (ASCII letters in any
+    /// case) and selects the newest match, scrolling to it. Empty ends the find.
+    pub fn find(&mut self, needle: &str) -> Found {
+        if needle.is_empty() {
+            self.find_end();
+            return Found::default();
+        }
+        unsafe {
+            if self.search.is_null() && ghostty_search_new(std::ptr::null(), &mut self.search, self.term) != GHOSTTY_SUCCESS {
+                self.search = std::ptr::null_mut();
+                return Found::default();
+            }
+            let s = GhosttyString { ptr: needle.as_ptr(), len: needle.len() };
+            ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, &s as *const _ as *const c_void);
+        }
+        self.find_step(true)
+    }
+
+    /// Selects the next match toward older output (`older`) or newer, wrapping.
+    pub fn find_step(&mut self, older: bool) -> Found {
+        if self.search.is_null() {
+            return Found::default();
+        }
+        self.placements_cache.get_mut().take();
+        let opt = if older { GHOSTTY_SEARCH_OPT_SELECT_NEXT } else { GHOSTTY_SEARCH_OPT_SELECT_PREV };
+        unsafe {
+            ghostty_search_run(self.search);
+            ghostty_search_set(self.search, opt, std::ptr::null());
+        }
+        self.select_found()
+    }
+
+    /// Where the find stands now, after output since the last step (the
+    /// selection is left alone: the person may have selected something).
+    pub fn found(&mut self) -> Found {
+        if self.search.is_null() {
+            return Found::default();
+        }
+        unsafe { ghostty_search_run(self.search) };
+        self.read_found()
+    }
+
+    fn read_found(&self) -> Found {
+        let mut found = Found::default();
+        unsafe {
+            ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_TOTAL_MATCHES, &mut found.total as *mut _ as *mut c_void);
+            let mut i = 0usize;
+            if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &mut i as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                found.selected = Some(i);
+            }
+        }
+        found
+    }
+
+    /// The selected match becomes the terminal's selection, so it's drawn highlighted.
+    fn select_found(&mut self) -> Found {
+        let found = self.read_found();
+        unsafe {
+            let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+            if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut sel as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void);
+            } else {
+                ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null());
+            }
+        }
+        found
+    }
+
+    /// Ends the find: no needle, no highlighted match. The view stays where it is.
+    pub fn find_end(&mut self) {
+        if self.search.is_null() {
+            return;
+        }
+        unsafe { ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null()) };
+        self.clear_selection();
+    }
+
     /// Wraps pasted text the way the program asked (bracketed paste or not).
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         if self.mode(BRACKETED_PASTE) {
@@ -1402,6 +1489,9 @@ impl Vt {
 impl Drop for Vt {
     fn drop(&mut self) {
         unsafe {
+            if !self.search.is_null() {
+                ghostty_search_free(self.search);
+            }
             ghostty_selection_gesture_event_free(self.press);
             ghostty_selection_gesture_event_free(self.drag);
             ghostty_selection_gesture_event_free(self.release);
@@ -1439,6 +1529,33 @@ mod tests {
                 vt.scroll_viewport(25);
             }
         }
+    }
+
+    #[test]
+    fn find_scrolls_back_to_matches_and_selects_them() {
+        let mut vt = Vt::new(40, 5);
+        for line in 1..=200 {
+            let word = if line == 20 || line == 150 { "Needle" } else { "hay" };
+            vt.write(format!("{line:03} {word}\r\n").as_bytes());
+        }
+        let row0 = |vt: &mut Vt| vt.frame().rows[0].iter().map(|c| c.text.as_str()).collect::<String>();
+        // Newest first, any ASCII case, scrolled into view.
+        let found = vt.find("needle");
+        assert_eq!(found, Found { selected: Some(0), total: 2 });
+        assert_eq!(vt.selection_text().as_deref(), Some("Needle"));
+        assert!(vt.frame().rows.iter().any(|r| r.iter().map(|c| c.text.as_str()).collect::<String>().starts_with("150 Needle")));
+        assert_eq!(vt.find_step(true), Found { selected: Some(1), total: 2 });
+        assert!(vt.frame().rows.iter().any(|r| r.iter().map(|c| c.text.as_str()).collect::<String>().starts_with("020 Needle")), "{}", row0(&mut vt));
+        // Wraps past the oldest, and back.
+        assert_eq!(vt.find_step(true).selected, Some(0));
+        assert_eq!(vt.find_step(false).selected, Some(1));
+        // Output since keeps counting.
+        vt.write(b"201 needle\r\n");
+        assert_eq!(vt.found().total, 3);
+        assert_eq!(vt.find("nothing here"), Found { selected: None, total: 0 });
+        assert_eq!(vt.selection_text(), None);
+        vt.find_end();
+        assert_eq!(vt.found(), Found { selected: None, total: 0 });
     }
 
     #[test]

@@ -548,6 +548,11 @@ The main ones:
   Shift+right-click is always Herdr's menu). Copy, paste, paste-image and implicit
   right-click targeting follow keyboard focus, including peek and floating terminals;
   with no terminal holding keyboard focus, they use the focused pane or block.
+  `terminal.find {text?}` opens the focused terminal's find bar (Cmd+F on macOS,
+  Ctrl+Shift+F elsewhere): it searches the screen and history as you type (ASCII
+  letters in any case), scrolls to the newest match and selects it; Enter or
+  `terminal.find_next` goes to older matches, Shift+Enter or `terminal.find_prev`
+  to newer, Esc closes it and leaves the view where it is.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. Programs that track the mouse still get their mouse events
   (hold Shift to select text instead).

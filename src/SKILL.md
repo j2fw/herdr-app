@@ -34,6 +34,9 @@ herdr-app do pane.split --direction right --pane p12
 herdr-app do agent.focus --terminal t7
 ```
 
+To point the person at text in the focused terminal (scrolling back to it and
+selecting it): `herdr-app do terminal.find --text "panicked at"`; Esc closes it.
+
 For a remote space:
 
 ```sh

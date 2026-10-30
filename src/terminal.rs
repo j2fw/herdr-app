@@ -104,6 +104,8 @@ pub struct TerminalView {
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: f32,
+    /// The find bar, while open: what's typed and where it stands.
+    find: Option<(String, vt::Found)>,
     _reader: Option<Task<()>>,
 }
 
@@ -174,6 +176,7 @@ impl TerminalView {
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
             scrolled: 0.0,
+            find: None,
             _reader: None,
         };
         view.connect(core, false, cx);
@@ -490,7 +493,61 @@ impl TerminalView {
         }
     }
 
+    /// Opens the find bar (or types `text` into it); an open bar searches again.
+    pub fn find(&mut self, text: Option<&str>, cx: &mut Context<Self>) {
+        let query = text.map(str::to_owned).or_else(|| self.find.as_ref().map(|f| f.0.clone())).unwrap_or_default();
+        let found = self.grid.borrow_mut().vt.find(&query);
+        self.find = Some((query, found));
+        cx.notify();
+    }
+
+    /// The next match toward older output (`older`) or newer.
+    pub fn find_step(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some((_, found)) = self.find.as_mut() else { return };
+        *found = self.grid.borrow_mut().vt.find_step(older);
+        cx.notify();
+    }
+
+    pub fn find_close(&mut self, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            self.grid.borrow_mut().vt.find_end();
+            cx.notify();
+        }
+    }
+
+    /// Keys while the find bar is open: typing edits the query, Enter goes to
+    /// older matches (Shift+Enter newer), Esc closes. Shortcuts pass through.
+    fn find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some((query, _)) = self.find.as_ref() else { return false };
+        let k = &ev.keystroke;
+        let m = k.modifiers;
+        if m.platform || m.control {
+            return false;
+        }
+        let mut query = query.clone();
+        match k.key.as_str() {
+            "escape" => self.find_close(cx),
+            "enter" | "down" | "up" => self.find_step(k.key == "down" || (k.key == "enter" && !m.shift), cx),
+            "backspace" => {
+                query.pop();
+                self.find(Some(&query), cx);
+            }
+            _ => match k.key_char.as_deref().or((k.key == "space").then_some(" ")) {
+                Some(text) if !text.chars().any(char::is_control) => {
+                    query.push_str(text);
+                    self.find(Some(&query), cx);
+                }
+                _ => {}
+            },
+        }
+        true
+    }
+
     fn key_down(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.find_key(ev, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let k = &ev.keystroke;
         // Typing clears a selection, as in Herdr.
         if !k.key.starts_with("shift") && !k.key.starts_with("control") && !k.key.starts_with("alt") {
@@ -1252,6 +1309,10 @@ impl EntityInputHandler for TerminalView {
 
     fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
         self.grid.borrow_mut().marked = None;
+        if let Some((query, _)) = self.find.as_ref() {
+            let query = format!("{query}{text}");
+            return self.find(Some(&query), cx);
+        }
         self.send(text.as_bytes());
         cx.notify();
     }
@@ -1301,6 +1362,11 @@ impl Render for TerminalView {
         let selection_view = cx.entity().downgrade();
         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
+        // Output since the last step can add matches or move the selected one.
+        if let Some((_, found)) = self.find.as_mut() {
+            *found = self.grid.borrow_mut().vt.found();
+        }
+        let find = self.find.clone();
 
         div()
             .id(SharedString::from(format!("term-{}", self.address)))
@@ -1448,6 +1514,50 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when_some(find, |d, (query, found)| {
+                let count = match (query.is_empty(), found.selected) {
+                    (true, _) => String::new(),
+                    (false, Some(i)) => format!("{}/{}", i + 1, found.total),
+                    (false, None) => "no matches".to_owned(),
+                };
+                d.child(
+                    div()
+                        .id("find-bar")
+                        .absolute()
+                        .top_2()
+                        .right_3()
+                        .w(rems(34.0))
+                        .max_w(relative(0.9))
+                        .h(rems(2.6))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .rounded_lg()
+                        .shadow_md()
+                        .border_1()
+                        .border_color(crate::settings::color("accent"))
+                        .bg(crate::settings::color("popover"))
+                        .text_color(crate::settings::color("foreground"))
+                        .text_sm()
+                        .font_family(crate::settings::get().ui_font_family.clone())
+                        // Clicks on the bar stay on it (no selection under it).
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(if query.is_empty() { "Find…".to_owned() } else { format!("{query}▏") }))
+                        .child(div().flex_none().text_color(crate::settings::color("muted")).child(count))
+                        .child(
+                            div()
+                                .id("find-close")
+                                .flex_none()
+                                .px_1()
+                                .cursor_pointer()
+                                .text_color(crate::settings::color("muted"))
+                                .hover(|s| s.text_color(crate::settings::color("foreground")))
+                                .on_click(cx.listener(|this, _, _, cx| this.find_close(cx)))
+                                .child("✕"),
+                        ),
+                )
+            })
             .when_some(ended, |d, why| {
                 d.child(
                     div()

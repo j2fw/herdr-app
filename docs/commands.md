@@ -301,6 +301,26 @@ Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when 
 
 No arguments.
 
+## `terminal.find`
+
+Find text in the focused terminal's screen and history: opens its find bar (with text, searches for it). Enter: older match, Shift+Enter: newer, Esc: close.
+
+| Argument | Required |
+|---|---|
+| `text` | no |
+
+## `terminal.find_next`
+
+Go to the next older match in the focused terminal's find bar.
+
+No arguments.
+
+## `terminal.find_prev`
+
+Go to the next newer match in the focused terminal's find bar.
+
+No arguments.
+
 ## `agent.focus`
 
 Show an agent (sub-agents too).
