@@ -480,6 +480,21 @@ pub struct Vt {
     pub win32: crate::win32_keys::Win32Input,
     /// The find bar's search, made the first time it's used (null until then).
     search: GhosttySearch,
+    /// A regex find, which Ghostty's search doesn't do: its matches as of `written`.
+    regex: Option<RegexFind>,
+    /// Counts writes and resizes: what the screen's text was read at.
+    written: u64,
+}
+
+/// A match's first and last cell, (x, y) in screen rows (0: the top of the scrollback).
+type Hit = ((u16, u32), (u16, u32));
+
+struct RegexFind {
+    re: fancy_regex::Regex,
+    /// Newest first, as Ghostty's search orders them.
+    hits: Vec<Hit>,
+    selected: Option<usize>,
+    at: u64,
 }
 
 /// Where a find stands: which match is selected (0 is the newest) of how many.
@@ -630,6 +645,8 @@ impl Vt {
                 placements_cache: RefCell::new(None),
                 win32: Default::default(),
                 search: std::ptr::null_mut(),
+                regex: None,
+                written: 0,
             };
             vt.apply_theme();
             vt
@@ -932,6 +949,18 @@ impl Vt {
         (unsafe { ghostty_terminal_grid_ref(self.term, p, &mut r) } == GHOSTTY_SUCCESS).then_some(r)
     }
 
+    /// Screen rows count from the top of the scrollback; the viewport starts here.
+    fn viewport_top(&self) -> Option<u32> {
+        unsafe {
+            let r = self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, 0, 0)?;
+            let mut p = GhosttyPointCoordinate::default();
+            if ghostty_terminal_point_from_grid_ref(self.term, &r, GHOSTTY_POINT_TAG_SCREEN, &mut p) != GHOSTTY_SUCCESS {
+                return None;
+            }
+            Some(p.y)
+        }
+    }
+
     /// The link at a viewport cell: a link the program marked (OSC 8), or a
     /// URL or path in the text. Follows lines the terminal wrapped, also into
     /// rows scrolled out of view.
@@ -939,15 +968,7 @@ impl Vt {
         if col >= self.cols || row >= self.rows {
             return None;
         }
-        // Screen rows count from the top of the scrollback; the viewport starts at `top`.
-        let top = unsafe {
-            let r = self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, 0, 0)?;
-            let mut p = GhosttyPointCoordinate::default();
-            if ghostty_terminal_point_from_grid_ref(self.term, &r, GHOSTTY_POINT_TAG_SCREEN, &mut p) != GHOSTTY_SUCCESS {
-                return None;
-            }
-            p.y
-        };
+        let top = self.viewport_top()?;
         let hovered = top + row as u32;
         let wraps = |y: u32| unsafe {
             let Some(r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) else { return false };
@@ -1038,6 +1059,7 @@ impl Vt {
 
     pub fn write(&mut self, bytes: &[u8]) {
         self.placements_cache.get_mut().take();
+        self.written += 1;
         self.win32.watch(bytes);
         unsafe { ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
     }
@@ -1055,6 +1077,7 @@ impl Vt {
             return;
         }
         self.placements_cache.get_mut().take();
+        self.written += 1;
         self.cols = cols;
         self.rows = rows;
         unsafe { ghostty_terminal_resize(self.term, cols, rows, cell_w.max(1), cell_h.max(1)) };
@@ -1117,6 +1140,7 @@ impl Vt {
     /// Searches the screen and scrollback for `needle` (ASCII letters in any
     /// case) and selects the newest match, scrolling to it. Empty ends the find.
     pub fn find(&mut self, needle: &str) -> Found {
+        self.regex = None;
         if needle.is_empty() {
             self.find_end();
             return Found::default();
@@ -1134,6 +1158,9 @@ impl Vt {
 
     /// Selects the next match toward older output (`older`) or newer, wrapping.
     pub fn find_step(&mut self, older: bool) -> Found {
+        if self.regex.is_some() {
+            return self.regex_step(older);
+        }
         if self.search.is_null() {
             return Found::default();
         }
@@ -1149,6 +1176,10 @@ impl Vt {
     /// Where the find stands now, after output since the last step (the
     /// selection is left alone: the person may have selected something).
     pub fn found(&mut self) -> Found {
+        // Matches are read again on the next step, not every frame (it's the whole scrollback).
+        if let Some(rf) = &self.regex {
+            return Found { selected: rf.selected, total: rf.hits.len() };
+        }
         if self.search.is_null() {
             return Found::default();
         }
@@ -1184,11 +1215,214 @@ impl Vt {
 
     /// Ends the find: no needle, no highlighted match. The view stays where it is.
     pub fn find_end(&mut self) {
+        if self.regex.take().is_some() {
+            self.clear_selection();
+        }
         if self.search.is_null() {
             return;
         }
         unsafe { ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null()) };
         self.clear_selection();
+    }
+
+    /// Where the find's matches show in the viewport, as (row, first column,
+    /// last column) per row: the selected match, and the others.
+    pub fn find_spans(&self) -> (Spans, Spans) {
+        let (mut current, mut others) = (Spans::new(), Spans::new());
+        let rows = self.rows as u32;
+        let last = self.cols.saturating_sub(1);
+        let mut add = |spans: &mut Spans, (x0, y0): (u16, i64), (x1, y1): (u16, i64)| {
+            for y in y0.max(0)..=y1.min(rows as i64 - 1) {
+                let from = if y == y0 { x0 } else { 0 };
+                let to = if y == y1 { x1 } else { last };
+                spans.push((y as u16, from, to));
+            }
+        };
+        if let Some(rf) = &self.regex {
+            let Some(top) = self.viewport_top() else { return (current, others) };
+            let (top, bottom) = (top as i64, top as i64 + rows as i64);
+            for (i, &((x0, y0), (x1, y1))) in rf.hits.iter().enumerate() {
+                let (y0, y1) = (y0 as i64 - top, y1 as i64 - top);
+                if y1 < 0 || y0 >= bottom - top {
+                    continue;
+                }
+                add(if rf.selected == Some(i) { &mut current } else { &mut others }, (x0, y0), (x1, y1));
+            }
+            return (current, others);
+        }
+        if self.search.is_null() {
+            return (current, others);
+        }
+        // A match's ends in viewport rows; an end above the viewport counts as row -1.
+        let ends = |sel: &GhosttySelection| -> Option<((u16, i64), (u16, i64))> {
+            let point = |r: &GhosttyGridRef| unsafe {
+                let mut p = GhosttyPointCoordinate::default();
+                (ghostty_terminal_point_from_grid_ref(self.term, r, GHOSTTY_POINT_TAG_SCREEN, &mut p) == GHOSTTY_SUCCESS).then_some((p.x, p.y as i64))
+            };
+            let top = self.viewport_top()? as i64;
+            let ((x0, y0), (x1, y1)) = (point(&sel.start)?, point(&sel.end)?);
+            Some(((x0, y0 - top), (x1, y1 - top)))
+        };
+        let mut selected = None;
+        unsafe {
+            let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+            if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut sel as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                selected = ends(&sel);
+            }
+            let mut buf = GhosttySelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
+            ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &mut buf as *mut _ as *mut c_void);
+            if buf.len > 0 {
+                let mut matches = vec![GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() }; buf.len];
+                buf = GhosttySelectionBuffer { ptr: matches.as_mut_ptr(), cap: matches.len(), len: 0 };
+                if ghostty_search_get(self.search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &mut buf as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                    for m in &matches[..buf.len.min(matches.len())] {
+                        if let Some(e) = ends(m).filter(|e| Some(*e) != selected) {
+                            add(&mut others, e.0, e.1);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((a, b)) = selected {
+            add(&mut current, a, b);
+        }
+        (current, others)
+    }
+
+    /// Searches the screen and scrollback for a regex (case-insensitive unless
+    /// it says `(?-i)`) and selects the newest match, scrolling to it. Matches
+    /// don't cross lines; lines the terminal wrapped count as one.
+    pub fn find_regex(&mut self, pattern: &str) -> Result<Found, String> {
+        if pattern.is_empty() {
+            self.find_end();
+            return Ok(Found::default());
+        }
+        let re = fancy_regex::Regex::new(&format!("(?i){pattern}")).map_err(|e| e.to_string())?;
+        if !self.search.is_null() {
+            unsafe { ghostty_search_set(self.search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null()) };
+        }
+        let hits = self.regex_hits(&re);
+        let selected = (!hits.is_empty()).then_some(0);
+        self.regex = Some(RegexFind { re, hits, selected, at: self.written });
+        Ok(self.show_regex())
+    }
+
+    fn regex_step(&mut self, older: bool) -> Found {
+        let written = self.written;
+        let Some(mut rf) = self.regex.take() else { return Found::default() };
+        if rf.at != written {
+            rf.hits = self.regex_hits(&rf.re);
+            rf.at = written;
+        }
+        let n = rf.hits.len();
+        rf.selected = match rf.selected {
+            _ if n == 0 => None,
+            None => Some(0),
+            Some(i) if older => Some((i + 1) % n),
+            Some(i) => Some((i.min(n - 1) + n - 1) % n),
+        };
+        self.regex = Some(rf);
+        self.show_regex()
+    }
+
+    /// Selects the regex find's selected match and scrolls to it if it's out of view.
+    fn show_regex(&mut self) -> Found {
+        let Some(rf) = &self.regex else { return Found::default() };
+        let found = Found { selected: rf.selected, total: rf.hits.len() };
+        let Some(((x0, y0), (x1, y1))) = rf.selected.map(|i| rf.hits[i]) else {
+            self.clear_selection();
+            return found;
+        };
+        let (Some(start), Some(end)) = (self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x0, y0), self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, x1, y1)) else {
+            self.clear_selection();
+            return found;
+        };
+        let sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle: false };
+        unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void) };
+        let top = self.viewport_top().unwrap_or(0);
+        if y0 < top || y1 >= top + self.rows as u32 {
+            // A third down, so what led up to it shows too.
+            self.placements_cache.get_mut().take();
+            let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
+            s.value.row = y0.saturating_sub(self.rows as u32 / 3) as usize;
+            unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+        }
+        found
+    }
+
+    /// Every match of `re`, newest first.
+    fn regex_hits(&self, re: &fancy_regex::Regex) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        for (text, spots) in self.screen_lines() {
+            // The cell holding a byte of the line.
+            let cell = |byte: usize| spots[spots.partition_point(|s| s.0 <= byte).saturating_sub(1)];
+            for m in re.find_iter(&text) {
+                let Ok(m) = m else { break };
+                if m.start() == m.end() {
+                    continue;
+                }
+                let (_, x0, y0) = cell(m.start());
+                let (_, x1, y1) = cell(m.end() - 1);
+                hits.push(((x0, y0), (x1, y1)));
+            }
+        }
+        hits.reverse();
+        hits
+    }
+
+    /// The screen and scrollback as lines of text (rows the terminal wrapped
+    /// joined, trailing blanks dropped), with each character's (byte, x, y).
+    fn screen_lines(&self) -> Vec<(String, Vec<(usize, u16, u32)>)> {
+        let mut lines = Vec::new();
+        let (mut text, mut spots) = (String::new(), Vec::new());
+        let mut end_line = |text: &mut String, spots: &mut Vec<(usize, u16, u32)>| {
+            let keep = text.trim_end().len();
+            text.truncate(keep);
+            spots.retain(|s: &(usize, u16, u32)| s.0 < keep);
+            if !text.is_empty() {
+                lines.push((std::mem::take(text), std::mem::take(spots)));
+            }
+            text.clear();
+            spots.clear();
+        };
+        let mut y = 0u32;
+        while let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) {
+            let wraps = unsafe {
+                let mut line: GhosttyRow = Default::default();
+                let mut wrap = false;
+                ghostty_grid_ref_row(&r, &mut line) == GHOSTTY_SUCCESS
+                    && ghostty_row_get(line, GHOSTTY_ROW_DATA_WRAP, &mut wrap as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+                    && wrap
+            };
+            for x in 0..self.cols {
+                r.x = x;
+                let wide = unsafe {
+                    let mut cell: GhosttyCell = Default::default();
+                    ghostty_grid_ref_cell(&r, &mut cell);
+                    let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+                    ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+                    wide
+                };
+                if wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD {
+                    continue;
+                }
+                let byte = text.len();
+                let mut cps = [0u32; 16];
+                let mut len = 0usize;
+                unsafe { ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len) };
+                text.extend(cps[..len.min(cps.len())].iter().filter_map(|c| char::from_u32(*c)));
+                if text.len() == byte {
+                    text.push(' ');
+                }
+                spots.push((byte, x, y));
+            }
+            if !wraps {
+                end_line(&mut text, &mut spots);
+            }
+            y += 1;
+        }
+        end_line(&mut text, &mut spots);
+        lines
     }
 
     /// Wraps pasted text the way the program asked (bracketed paste or not).
@@ -1543,6 +1777,13 @@ mod tests {
         let found = vt.find("needle");
         assert_eq!(found, Found { selected: Some(0), total: 2 });
         assert_eq!(vt.selection_text().as_deref(), Some("Needle"));
+        // The selected match's cells, in viewport rows; the other one is out of view.
+        let (current, others) = vt.find_spans();
+        assert_eq!(current.len(), 1);
+        let (y, x0, x1) = current[0];
+        let row: String = vt.frame().rows[y as usize].iter().map(|c| c.text.as_str()).collect();
+        assert_eq!((x0, x1, &row[..10]), (4, 9, "150 Needle"));
+        assert!(others.is_empty());
         assert!(vt.frame().rows.iter().any(|r| r.iter().map(|c| c.text.as_str()).collect::<String>().starts_with("150 Needle")));
         assert_eq!(vt.find_step(true), Found { selected: Some(1), total: 2 });
         assert!(vt.frame().rows.iter().any(|r| r.iter().map(|c| c.text.as_str()).collect::<String>().starts_with("020 Needle")), "{}", row0(&mut vt));
@@ -1556,6 +1797,45 @@ mod tests {
         assert_eq!(vt.selection_text(), None);
         vt.find_end();
         assert_eq!(vt.found(), Found { selected: None, total: 0 });
+    }
+
+    #[test]
+    fn regex_find_scrolls_back_to_matches_across_wrapped_rows() {
+        let mut vt = Vt::new(20, 5);
+        for line in 1..=100 {
+            match line {
+                10 => vt.write(b"error: E0308 mismatched\r\n"),
+                // 30 columns: wraps onto a second row, the match straddles it.
+                50 => vt.write(format!("{}error: E0599 here\r\n", "x".repeat(10)).as_bytes()),
+                _ => vt.write(format!("{line:03} fine\r\n").as_bytes()),
+            }
+        }
+        let shown = |vt: &mut Vt, needle: &str| vt.frame().rows.iter().any(|r| r.iter().map(|c| c.text.as_str()).collect::<String>().contains(needle));
+        let found = vt.find_regex(r"ERROR: E0\d{3}").unwrap();
+        assert_eq!(found, Found { selected: Some(0), total: 2 });
+        assert_eq!(vt.selection_text().as_deref(), Some("error: E0599"));
+        assert!(shown(&mut vt, "error: E05") && shown(&mut vt, "99 here"));
+        assert_eq!(vt.find_step(true), Found { selected: Some(1), total: 2 });
+        assert_eq!(vt.selection_text().as_deref(), Some("error: E0308"));
+        assert!(shown(&mut vt, "error: E0308"));
+        assert_eq!(vt.find_step(true).selected, Some(0));
+        assert_eq!(vt.find_step(false).selected, Some(1));
+        // (?-i) asks for case; new output is found on the next step.
+        assert_eq!(vt.find_regex(r"(?-i)ERROR").unwrap().total, 0);
+        vt.find_regex(r"E0\d+").unwrap();
+        vt.write(b"error: E0001\r\n");
+        assert_eq!(vt.find_step(true).total, 3);
+        // Two in view: the selected one, and the rest.
+        vt.find_regex(r"\b\d{3} fine").unwrap();
+        let (current, others) = vt.find_spans();
+        assert_eq!(current.len(), 1);
+        assert!(!others.is_empty() && others.iter().all(|&(y, x0, x1)| y < 5 && (x0, x1) == (0, 7)));
+        assert!(vt.find_regex("(unclosed").is_err());
+        // Back to plain text drops the regex.
+        assert_eq!(vt.find("e0308").total, 1);
+        vt.find_end();
+        assert_eq!(vt.found(), Found::default());
+        assert_eq!(vt.find_spans(), (Spans::new(), Spans::new()));
     }
 
     #[test]

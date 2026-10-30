@@ -303,11 +303,12 @@ No arguments.
 
 ## `terminal.find`
 
-Find text in the focused terminal's screen and history: opens its find bar (with text, searches for it). Enter: older match, Shift+Enter: newer, Esc: close.
+Find text in the focused terminal's screen and history: opens its find bar (with text, searches for it; regex: true for a regex, case-insensitive unless (?-i)). Enter: older match, Shift+Enter: newer, Alt+R: regex on/off, Esc: close.
 
 | Argument | Required |
 |---|---|
 | `text` | no |
+| `regex` | no |
 
 ## `terminal.find_next`
 

@@ -344,6 +344,9 @@ fn resolve(p: &Palette, overrides: &BTreeMap<String, String>) -> Theme {
         ("solid_foreground", hex(if light { 0xffffff } else { mix(bg, 0, 0.28) })),
         ("ring", hex(mix(bg, fg, 0.7))),
         ("selection", hex(p.selection)),
+        // Find bar matches in a terminal, behind the text: the selected one, and the rest.
+        ("find_current", format!("{}aa", hex(mix(p.ansi[1], p.ansi[3], 0.5)))),
+        ("find_match", format!("{}59", hex(p.ansi[3]))),
         ("cursor", hex(p.cursor.unwrap_or(p.foreground))),
         ("working", hex(working)),
         ("blocked", hex(blocked)),

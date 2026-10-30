@@ -32,6 +32,16 @@ enum LinkTarget {
     Terminal(String),
 }
 
+/// The find bar: what's typed, whether it's a regex, and where it stands.
+#[derive(Clone, Default)]
+struct FindBar {
+    query: String,
+    regex: bool,
+    found: vt::Found,
+    /// The regex doesn't parse.
+    error: Option<String>,
+}
+
 pub enum TerminalEvent {
     Peek(String),
     TitleChanged,
@@ -104,8 +114,8 @@ pub struct TerminalView {
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: f32,
-    /// The find bar, while open: what's typed and where it stands.
-    find: Option<(String, vt::Found)>,
+    /// The find bar, while open.
+    find: Option<FindBar>,
     _reader: Option<Task<()>>,
 }
 
@@ -493,19 +503,43 @@ impl TerminalView {
         }
     }
 
-    /// Opens the find bar (or types `text` into it); an open bar searches again.
-    pub fn find(&mut self, text: Option<&str>, cx: &mut Context<Self>) {
-        let query = text.map(str::to_owned).or_else(|| self.find.as_ref().map(|f| f.0.clone())).unwrap_or_default();
-        let found = self.grid.borrow_mut().vt.find(&query);
-        self.find = Some((query, found));
+    /// Opens the find bar (or types `text` into it, as a regex or not); an
+    /// open bar searches again.
+    pub fn find(&mut self, text: Option<&str>, regex: Option<bool>, cx: &mut Context<Self>) {
+        let mut bar = self.find.take().unwrap_or_default();
+        if let Some(text) = text {
+            bar.query = text.to_owned();
+        }
+        if let Some(regex) = regex {
+            bar.regex = regex;
+        }
+        let mut g = self.grid.borrow_mut();
+        (bar.found, bar.error) = if bar.regex {
+            match g.vt.find_regex(&bar.query) {
+                Ok(found) => (found, None),
+                Err(e) => {
+                    g.vt.find_end();
+                    (vt::Found::default(), Some(e))
+                }
+            }
+        } else {
+            (g.vt.find(&bar.query), None)
+        };
+        drop(g);
+        self.find = Some(bar);
         cx.notify();
     }
 
     /// The next match toward older output (`older`) or newer.
     pub fn find_step(&mut self, older: bool, cx: &mut Context<Self>) {
-        let Some((_, found)) = self.find.as_mut() else { return };
-        *found = self.grid.borrow_mut().vt.find_step(older);
+        let Some(bar) = self.find.as_mut() else { return };
+        bar.found = self.grid.borrow_mut().vt.find_step(older);
         cx.notify();
+    }
+
+    fn find_toggle_regex(&mut self, cx: &mut Context<Self>) {
+        let regex = !self.find.as_ref().is_some_and(|b| b.regex);
+        self.find(None, Some(regex), cx);
     }
 
     pub fn find_close(&mut self, cx: &mut Context<Self>) {
@@ -516,26 +550,31 @@ impl TerminalView {
     }
 
     /// Keys while the find bar is open: typing edits the query, Enter goes to
-    /// older matches (Shift+Enter newer), Esc closes. Shortcuts pass through.
+    /// older matches (Shift+Enter newer), Alt+R toggles regex, Esc closes.
+    /// Shortcuts pass through.
     fn find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let Some((query, _)) = self.find.as_ref() else { return false };
+        let Some(bar) = self.find.as_ref() else { return false };
         let k = &ev.keystroke;
         let m = k.modifiers;
+        if m.alt && !m.platform && !m.control && k.key == "r" {
+            self.find_toggle_regex(cx);
+            return true;
+        }
         if m.platform || m.control {
             return false;
         }
-        let mut query = query.clone();
+        let mut query = bar.query.clone();
         match k.key.as_str() {
             "escape" => self.find_close(cx),
             "enter" | "down" | "up" => self.find_step(k.key == "down" || (k.key == "enter" && !m.shift), cx),
             "backspace" => {
                 query.pop();
-                self.find(Some(&query), cx);
+                self.find(Some(&query), None, cx);
             }
             _ => match k.key_char.as_deref().or((k.key == "space").then_some(" ")) {
                 Some(text) if !text.chars().any(char::is_control) => {
                     query.push_str(text);
-                    self.find(Some(&query), cx);
+                    self.find(Some(&query), None, cx);
                 }
                 _ => {}
             },
@@ -1152,6 +1191,9 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     }
     g.images.retain(|k, _| keep.contains(k));
     let link_spans = g.link_spans.clone();
+    let (find_current, find_others) = g.vt.find_spans();
+    let find_colors = (!find_current.is_empty() || !find_others.is_empty())
+        .then(|| (crate::settings::color("find_current"), crate::settings::color("find_match")));
     let marked = g.marked.clone();
     drop(g);
 
@@ -1199,12 +1241,24 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             }
             &painted[y].1
         };
+        // Backgrounds, then find matches over them, then the text on top.
+        for op in ops {
+            if let RowOp::Bg { from, to, color } = op {
+                let b = Bounds::new(at(*from, y), size(cell.width * (to - from) as f32, cell.height));
+                window.paint_quad(fill(snap_box(b), *color));
+            }
+        }
+        if let Some((current, other)) = find_colors {
+            for (spans, color) in [(&find_others, other), (&find_current, current)] {
+                for &(_, x0, x1) in spans.iter().filter(|s| s.0 as usize == y) {
+                    let b = Bounds::new(at(x0 as usize, y), size(cell.width * (x1 - x0 + 1) as f32, cell.height));
+                    window.paint_quad(fill(snap_box(b), color));
+                }
+            }
+        }
         for op in ops {
             match op {
-                RowOp::Bg { from, to, color } => {
-                    let b = Bounds::new(at(*from, y), size(cell.width * (to - from) as f32, cell.height));
-                    window.paint_quad(fill(snap_box(b), *color));
-                }
+                RowOp::Bg { .. } => {}
                 RowOp::Sprite { x, text, color } => crate::sprites::paint(text, Bounds::new(at(*x, y), cell), *color, window),
                 RowOp::Icon { x, offset, font, glyph, size, color } => {
                     let _ = window.paint_glyph(at(*x, y) + *offset, *font, *glyph, *size, *color);
@@ -1309,9 +1363,9 @@ impl EntityInputHandler for TerminalView {
 
     fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
         self.grid.borrow_mut().marked = None;
-        if let Some((query, _)) = self.find.as_ref() {
-            let query = format!("{query}{text}");
-            return self.find(Some(&query), cx);
+        if let Some(bar) = self.find.as_ref() {
+            let query = format!("{}{text}", bar.query);
+            return self.find(Some(&query), None, cx);
         }
         self.send(text.as_bytes());
         cx.notify();
@@ -1363,8 +1417,8 @@ impl Render for TerminalView {
         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
         // Output since the last step can add matches or move the selected one.
-        if let Some((_, found)) = self.find.as_mut() {
-            *found = self.grid.borrow_mut().vt.found();
+        if let Some(bar) = self.find.as_mut().filter(|b| b.error.is_none()) {
+            bar.found = self.grid.borrow_mut().vt.found();
         }
         let find = self.find.clone();
 
@@ -1514,12 +1568,14 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
-            .when_some(find, |d, (query, found)| {
-                let count = match (query.is_empty(), found.selected) {
-                    (true, _) => String::new(),
-                    (false, Some(i)) => format!("{}/{}", i + 1, found.total),
-                    (false, None) => "no matches".to_owned(),
+            .when_some(find, |d, FindBar { query, regex, found, error }| {
+                let count = match (query.is_empty(), found.selected, &error) {
+                    (true, _, _) => String::new(),
+                    (false, _, Some(_)) => "invalid regex".to_owned(),
+                    (false, Some(i), _) => format!("{}/{}", i + 1, found.total),
+                    (false, None, _) => "no matches".to_owned(),
                 };
+                let placeholder = if regex { "Find regex…" } else { "Find…" };
                 d.child(
                     div()
                         .id("find-bar")
@@ -1543,8 +1599,22 @@ impl Render for TerminalView {
                         .font_family(crate::settings::get().ui_font_family.clone())
                         // Clicks on the bar stay on it (no selection under it).
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(if query.is_empty() { "Find…".to_owned() } else { format!("{query}▏") }))
-                        .child(div().flex_none().text_color(crate::settings::color("muted")).child(count))
+                        .when_some(error, |d, e| d.tooltip(move |_, cx| cx.new(|_| FindError(e.clone())).into()))
+                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(if query.is_empty() { placeholder.to_owned() } else { format!("{query}▏") }))
+                        .child(div().flex_none().text_color(crate::settings::color(if count == "invalid regex" { "blocked" } else { "muted" })).child(count))
+                        .child(
+                            div()
+                                .id("find-regex")
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .font_family(crate::settings::get().font_family.clone())
+                                .when(regex, |d| d.bg(crate::settings::color("accent")).text_color(crate::settings::color("accent_foreground")))
+                                .when(!regex, |d| d.text_color(crate::settings::color("muted")).hover(|s| s.text_color(crate::settings::color("foreground"))))
+                                .on_click(cx.listener(|this, _, _, cx| this.find_toggle_regex(cx)))
+                                .child(".*"),
+                        )
                         .child(
                             div()
                                 .id("find-close")
@@ -1573,6 +1643,26 @@ impl Render for TerminalView {
                         .child(format!("[{why}]")),
                 )
             })
+    }
+}
+
+/// Why the find bar's regex doesn't parse, shown on hover.
+struct FindError(String);
+
+impl Render for FindError {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(rems(30.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(crate::settings::color("border"))
+            .bg(crate::settings::color("popover"))
+            .text_color(crate::settings::color("foreground"))
+            .text_xs()
+            .font_family(crate::settings::get().font_family.clone())
+            .child(self.0.clone())
     }
 }
 

@@ -552,7 +552,12 @@ The main ones:
   Ctrl+Shift+F elsewhere): it searches the screen and history as you type (ASCII
   letters in any case), scrolls to the newest match and selects it; Enter or
   `terminal.find_next` goes to older matches, Shift+Enter or `terminal.find_prev`
-  to newer, Esc closes it and leaves the view where it is.
+  to newer, Esc closes it and leaves the view where it is. Alt+R or the bar's `.*`
+  (or `regex: true`) searches with a regex instead: case-insensitive unless
+  `(?-i)`, within a line (wrapped rows count as one line). Matches in view are
+  highlighted behind the text: the selected one in theme color `find_current`,
+  the rest in `find_match` (`#rrggbbaa` keeps the text readable), e.g.
+  settings.json `"colors": { "find_current": "#ff8c00aa", "find_match": "#ffd70066" }`.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. Programs that track the mouse still get their mouse events
   (hold Shift to select text instead).
@@ -881,7 +886,8 @@ All of it is in `herdr.d.ts`. In short:
   (sidebars, bars), surface, popover, raised, hover, selected, border,
   input (a stronger border), foreground, muted, dim, accent,
   accent_foreground, solid and solid_foreground (a primary button),
-  selection, working, blocked, done, idle, unknown, ansi0..15; light and
+  selection, find_current and find_match (terminal find highlights), working,
+  blocked, done, idle, unknown, ansi0..15; light and
   dark themes name the same ones), `settings()` (with `dark`: the
   appearance now), `keys()`, `commands()` (every app
   command, its arguments and what it does), `layouts()` (the layout names).

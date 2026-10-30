@@ -35,7 +35,8 @@ herdr-app do agent.focus --terminal t7
 ```
 
 To point the person at text in the focused terminal (scrolling back to it and
-selecting it): `herdr-app do terminal.find --text "panicked at"`; Esc closes it.
+selecting it): `herdr-app do terminal.find --text "panicked at"` (add
+`--regex true` for a regex); Esc closes it.
 
 For a remote space:
 
